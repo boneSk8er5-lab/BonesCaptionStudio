@@ -1,0 +1,31 @@
+# Build output
+build/
+dist/
+release/
+*.rar
+*.zip
+__pycache__/
+*.pyc
+
+# Big binaries / models (shipped in the release zip, not the repo)
+ffmpeg.exe
+ffprobe.exe
+models/
+*.pt
+
+# Test footage / exports
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+
+# Runtime + logs
+data/
+portable.txt
+version.txt
+debug_log.txt
+font_favorites.json
+build_log.txt
+release_log.txt
+python_check.txt

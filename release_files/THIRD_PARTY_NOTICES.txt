@@ -1,0 +1,24 @@
+THIRD-PARTY SOFTWARE
+====================
+
+Bones Caption Studio includes the following open-source components.
+Each is the property of its respective authors and is distributed under its own license.
+
+- Python (PSF License) ............................. https://www.python.org
+- Qt for Python / PySide6 (LGPL v3) ................ https://www.qt.io/qt-for-python
+    PySide6 / Qt are dynamically linked and can be replaced by the user, as the LGPL requires.
+- OpenAI Whisper (MIT License) ..................... https://github.com/openai/whisper
+- Whisper model weights (MIT License) .............. https://github.com/openai/whisper
+- PyTorch (BSD-3-Clause) ........................... https://pytorch.org
+- NumPy (BSD-3-Clause) ............................. https://numpy.org
+- Numba / llvmlite (BSD-2-Clause) .................. https://numba.pydata.org
+- tiktoken (MIT License) ........................... https://github.com/openai/tiktoken
+- Pillow (MIT-CMU / HPND License) .................. https://python-pillow.org
+- tqdm (MIT / MPL-2.0) ............................. https://github.com/tqdm/tqdm
+- FFmpeg / FFprobe (LGPL v2.1+ or GPL v2+/v3, depending on how the build was configured)
+    https://ffmpeg.org  -  source code: https://ffmpeg.org/download.html
+    The included ffmpeg.exe and ffprobe.exe are unmodified builds; run "ffmpeg -version" in
+    the _internal folder to see the exact version and configuration.
+- PyInstaller bootloader (GPL v2 with a bootloader exception) .. https://pyinstaller.org
+
+Full license texts for most packages are inside the _internal folder (*.dist-info).
