@@ -4,10 +4,14 @@ Bones Caption Studio - build environments + portable releases.
     python release.py setup [cpu|gpu|all]   one-time: create the private build environments
     python release.py build [cpu|gpu|all]   build portable release zip(s)
     python release.py run                   run the app from source (GPU environment if set up)
+    python release.py clean [version]       tidy the releases folder, keeping one version's upload files
 
 The build environments live in %LOCALAPPDATA%\\BonesCaptionStudio\\envs (outside OneDrive), so your
-normal Python and its packages (TTS etc.) are never changed. Releases go to
-%USERPROFILE%\\BonesCaptionStudio_Releases (also outside OneDrive).
+normal Python and its packages (TTS etc.) are never changed.
+
+%USERPROFILE%\\BonesCaptionStudio_Releases only ever holds the newest release: the files to upload
+to GitHub plus RELEASE_NOTES.md. Older releases go to the Recycle Bin. An unzipped copy of the newest
+build (for testing) is kept in %LOCALAPPDATA%\\BonesCaptionStudio\\latest_build.
 
   CPU edition: small, runs on every Windows 10/11 64-bit PC.
   GPU edition: NVIDIA graphics cards transcribe much faster; on other PCs it falls back to the CPU.
@@ -28,7 +32,9 @@ LOCAL = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "B
 ENVS = os.path.join(LOCAL, "envs")
 WORK = os.path.join(LOCAL, "pyinstaller")
 OUT_ROOT = os.path.join(os.path.expanduser("~"), "BonesCaptionStudio_Releases")
-COUNTER_FILE = os.path.join(OUT_ROOT, "beta_counter.json")
+LATEST = os.path.join(LOCAL, "latest_build")
+COUNTER_FILE = os.path.join(LOCAL, "beta_counter.json")
+_OLD_COUNTER = os.path.join(OUT_ROOT, "beta_counter.json")
 GITHUB_LIMIT = 2 * 1024 ** 3          # GitHub: each release file must be under 2 GB
 PART_SIZE = 1900 * 1024 ** 2          # split bigger zips into 1.9 GB parts
 
@@ -43,6 +49,11 @@ APP_PACKAGES = ["openai-whisper==20250625", "PySide6", "Pillow", "pyinstaller"]
 
 os.makedirs(LOCAL, exist_ok=True)
 os.makedirs(OUT_ROOT, exist_ok=True)
+if os.path.exists(_OLD_COUNTER):  # older versions kept the counter in the releases folder
+    if not os.path.exists(COUNTER_FILE):
+        shutil.move(_OLD_COUNTER, COUNTER_FILE)
+    else:
+        os.remove(_OLD_COUNTER)
 LOG = open(os.path.join(ROOT, "release_log.txt"), "a", encoding="utf-8")
 
 
@@ -74,6 +85,50 @@ def run(cmd, show=False):
 
 def human(n):
     return f"{n / 1024 ** 2:,.0f} MB"
+
+
+def recycle(paths):
+    """Send files/folders to the Recycle Bin (anything too big for the bin is deleted outright)."""
+    paths = [os.path.abspath(p) for p in paths if os.path.exists(p)]
+    if not paths:
+        return
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        class SHFILEOPSTRUCTW(ctypes.Structure):
+            _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT), ("pFrom", wintypes.LPCWSTR),
+                        ("pTo", wintypes.LPCWSTR), ("fFlags", ctypes.c_uint16), ("fAnyOperationsAborted", wintypes.BOOL),
+                        ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", wintypes.LPCWSTR)]
+        buffer = ctypes.create_unicode_buffer("\0".join(paths) + "\0\0")
+        op = SHFILEOPSTRUCTW()
+        op.wFunc = 3                                   # FO_DELETE
+        op.pFrom = ctypes.cast(buffer, wintypes.LPCWSTR)
+        op.fFlags = 0x40 | 0x10 | 0x4 | 0x400          # ALLOWUNDO | NOCONFIRMATION | SILENT | NOERRORUI
+        if ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op)) == 0:
+            paths = [p for p in paths if os.path.exists(p)]
+    for p in paths:  # fallback / non-Windows
+        if os.path.isdir(p):
+            shutil.rmtree(p, ignore_errors=True)
+        elif os.path.exists(p):
+            os.remove(p)
+
+
+def release_files(version):
+    """The upload files for one version: the zip (or its .001/.002 parts) and the JOIN .bat."""
+    return [n for n in os.listdir(OUT_ROOT)
+            if f"_v{version}_" in n and os.path.isfile(os.path.join(OUT_ROOT, n))
+            and re.search(r"\.zip(\.\d{3})?$|^JOIN_.*\.bat$", n)]
+
+
+def tidy_releases(keep_version):
+    keep = set(release_files(keep_version)) | {"RELEASE_NOTES.md"}
+    junk = [os.path.join(OUT_ROOT, n) for n in os.listdir(OUT_ROOT) if n not in keep]
+    if junk:
+        say(f"Tidying the releases folder: {len(junk)} old item(s) to the Recycle Bin")
+        for j in junk:
+            LOG.write(f"  recycle {j}\n")
+        recycle(junk)
 
 
 def env_python(edition):
@@ -231,9 +286,10 @@ def build_edition(ed, version, base_model, docs):
             fail(f"{needed} is missing from the {ed} build")
 
     name = f"BonesCaptionStudio_v{version}_{info['label']}"
-    out_dir = os.path.join(OUT_ROOT, name)
-    if os.path.exists(out_dir):
-        shutil.rmtree(out_dir)
+    test_root = os.path.join(LATEST, ed)          # unzipped copy for testing, outside the releases folder
+    if os.path.exists(test_root):
+        shutil.rmtree(test_root)
+    out_dir = os.path.join(test_root, name)
     shutil.copytree(app, out_dir)
     with open(os.path.join(out_dir, "portable.txt"), "w", encoding="utf-8") as f:
         f.write("This file turns on portable mode.\n"
@@ -245,7 +301,7 @@ def build_edition(ed, version, base_model, docs):
     shutil.copy2(base_model, os.path.join(out_dir, "models", "base.pt"))
     for src in docs:
         shutil.copy2(src, os.path.join(out_dir, os.path.basename(src)))
-    say("Folder:", out_dir, human(folder_size(out_dir)))
+    say("Test copy:", out_dir, human(folder_size(out_dir)))
 
     zip_path = os.path.join(OUT_ROOT, f"BonesCaptionStudio_v{version}_{info['zip_tag']}.zip")
     say("Zipping (a few minutes)...")
@@ -253,7 +309,7 @@ def build_edition(ed, version, base_model, docs):
         for root, _, files in os.walk(out_dir):
             for fn in files:
                 full = os.path.join(root, fn)
-                z.write(full, os.path.relpath(full, OUT_ROOT))
+                z.write(full, os.path.relpath(full, test_root))
     size = os.path.getsize(zip_path)
     digest = sha256_of(zip_path)
     say("Zip:", os.path.basename(zip_path), human(size))
@@ -265,8 +321,6 @@ def build_edition(ed, version, base_model, docs):
         result["parts"] = [os.path.basename(p) for p in parts]
         result["join"] = os.path.basename(join_bat)
         say("Parts:", ", ".join(result["parts"]), "+", result["join"])
-    with open(os.path.join(OUT_ROOT, f"{os.path.basename(zip_path)}.sha256.txt"), "w", encoding="utf-8") as f:
-        f.write(f"{digest}  {os.path.basename(zip_path)}\n")
     return result
 
 
@@ -318,7 +372,7 @@ Click **📂 Logs & Settings** at the top of the app and attach `debug_log.txt`,
 ## SHA-256
 {sums}
 """
-    path = os.path.join(OUT_ROOT, f"RELEASE_NOTES_v{version}.md")
+    path = os.path.join(OUT_ROOT, "RELEASE_NOTES.md")
     with open(path, "w", encoding="utf-8") as f:
         f.write(notes)
     return path
@@ -356,12 +410,37 @@ def build(editions):
     counters[base] = beta
     with open(COUNTER_FILE, "w", encoding="utf-8") as f:
         json.dump(counters, f, indent=2)
+    tidy_releases(version)
     say("")
     say("RELEASE OK")
-    say("  Output folder:", OUT_ROOT)
+    say("  Upload these to GitHub:", ", ".join(sorted(release_files(version))))
     say("  Notes:", os.path.basename(notes))
+    say("  Unzipped test copies:", LATEST)
     if sys.platform == "win32":
         os.startfile(OUT_ROOT)
+
+
+def clean(version=None):
+    """Keep only one version's upload files (default: the newest) and reset the beta counter to it."""
+    if not version:
+        base, beta, _ = next_version()
+        version = f"{base}-beta.{beta - 1}"
+    version = version.lstrip("v")
+    if not release_files(version):
+        fail(f"No release files for v{version} in {OUT_ROOT}")
+    say(f"Keeping v{version}: " + ", ".join(sorted(release_files(version))))
+    tidy_releases(version)
+    match = re.match(r"(.+)-beta\.(\d+)$", version)
+    if match:
+        try:
+            with open(COUNTER_FILE, "r", encoding="utf-8") as f:
+                counters = json.load(f)
+        except Exception:
+            counters = {}
+        counters[match.group(1)] = int(match.group(2))
+        with open(COUNTER_FILE, "w", encoding="utf-8") as f:
+            json.dump(counters, f, indent=2)
+    say("CLEAN OK")
 
 
 if __name__ == "__main__":
@@ -374,5 +453,7 @@ if __name__ == "__main__":
         build(pick_editions(arg))
     elif command == "run":
         run_app()
+    elif command == "clean":
+        clean(arg)
     else:
         fail(f"Unknown command '{command}' (use setup, build or run)")
