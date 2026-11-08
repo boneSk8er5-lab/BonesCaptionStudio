@@ -19,6 +19,8 @@ Each is the property of its respective authors and is distributed under its own 
     https://ffmpeg.org  -  source code: https://ffmpeg.org/download.html
     The included ffmpeg.exe and ffprobe.exe are unmodified builds; run "ffmpeg -version" in
     the _internal folder to see the exact version and configuration.
+- Resemblyzer voice encoder weights (Apache License 2.0) ... https://github.com/resemble-ai/Resemblyzer
+    Used for voice detection; converted to voice_encoder.npz, run with NumPy.
 - PyInstaller bootloader (GPL v2 with a bootloader exception) .. https://pyinstaller.org
 
 Full license texts for most packages are inside the _internal folder (*.dist-info).

@@ -6,7 +6,7 @@ from PyInstaller.utils.hooks import collect_all
 whisper_datas, whisper_binaries, whisper_hidden = collect_all('whisper')
 
 # App icon is bundled so the window/taskbar use it too
-extra_datas = [('BCS.ico', '.')] if os.path.exists('BCS.ico') else []
+extra_datas = [(f, '.') for f in ('BCS.ico', 'voice_encoder.npz') if os.path.exists(f)]  # icon + built-in voice model
 
 # If ffmpeg.exe / ffprobe.exe sit next to this .spec they get bundled automatically,
 # so a rebuild never leaves you without them.
@@ -17,7 +17,7 @@ a = Analysis(
     pathex=[],
     binaries=whisper_binaries + extra_binaries,
     datas=whisper_datas + extra_datas,
-    hiddenimports=['tiktoken', 'regex', 'tqdm', 'torch', 'numpy'] + whisper_hidden,
+    hiddenimports=['tiktoken', 'regex', 'tqdm', 'torch', 'numpy', 'voice_detect'] + whisper_hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

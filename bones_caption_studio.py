@@ -1,6 +1,7 @@
 # =====================================================================
 # BONES CAPTION STUDIO
-# VERSION: 6.5.0
+# VERSION: 6.6.0
+#   - 6.6: voices (manual + automatic detection) with per-voice colours/name tags; transcript editor with lines, hide/restore, search, undo
 #   - 6.5: shadow angle/distance/softness, strength up to 300%; pick which audio track to caption
 #   - 6.4: soft drop shadow option with adjustable strength
 #   - 6.3.1: sidebar no longer cut off; draggable divider between settings and preview
@@ -15,7 +16,7 @@
 #   - Save / open projects (.bcs.json), style presets
 #   - Settings + log live in %APPDATA%\BonesCaptionStudio
 # =====================================================================
-APP_VERSION = "6.5.0"
+APP_VERSION = "6.6.0"
 APP_NAME = "Bones Caption Studio"
 
 import sys
@@ -49,8 +50,9 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QPushButton, QFileDialog, QLabel,
     QHBoxLayout, QVBoxLayout, QGridLayout, QComboBox, QLineEdit, QInputDialog,
-    QFrame, QListWidget, QListWidgetItem, QColorDialog, QProgressBar, QCheckBox,
-    QMessageBox, QSlider, QSpinBox, QDoubleSpinBox, QScrollArea, QAbstractItemView, QSplitter
+    QFrame, QColorDialog, QProgressBar, QCheckBox,
+    QMessageBox, QSlider, QSpinBox, QDoubleSpinBox, QScrollArea, QAbstractItemView, QSplitter,
+    QTreeWidget, QTreeWidgetItem, QMenu, QHeaderView
 )
 from PySide6.QtCore import Qt, QTimer, QSize, Signal, QThread, QUrl, QElapsedTimer
 try:
@@ -308,8 +310,16 @@ DEFAULT_STYLE = {
     "shadow_angle": 45,     # direction the shadow falls: 0 = right, 90 = down, 180 = left, 270 = up
     "shadow_distance": 6,   # how far the shadow sits from the text, % of the text size
     "shadow_softness": 50,  # 0 = hard edge, 100 = very soft
+    "voice_colors": "highlight",  # how voices are coloured: off | highlight | line
+    "voice_names": False,         # show "Name:" in front of each caption
 }
-HOLD_GAP = 0.5  # keep a caption on screen through pauses shorter than this (stops flicker)
+HOLD_GAP = 0.5
+VOICE_PALETTE = [[255, 212, 0], [0, 229, 255], [255, 79, 216], [124, 255, 79],
+                 [255, 159, 28], [178, 141, 255], [255, 82, 82], [255, 255, 255]]
+
+
+def default_voice(n):
+    return {"name": f"Voice {n + 1}", "color": list(VOICE_PALETTE[n % len(VOICE_PALETTE)])}  # keep a caption on screen through pauses shorter than this (stops flicker)
 
 
 MAX_WORD_SECONDS = 1.0  # Whisper sometimes stretches the word before a pause right through the silence
@@ -325,6 +335,9 @@ def build_groups(words, mode, max_words, pause_split=0.5):
         if mode == "word":
             raw_groups.append([i])
             continue
+        if current and w.get("speaker") != words[current[-1]].get("speaker"):
+            raw_groups.append(current)  # a different voice: start a fresh caption
+            current = []
         if mode == "auto" and current and w["start"] - spoken_end(words[current[-1]]) >= pause_split:
             raw_groups.append(current)  # the speaker paused: start a fresh caption
             current = []
@@ -347,8 +360,8 @@ def build_groups(words, mode, max_words, pause_split=0.5):
 
 class CaptionTrack:
     def __init__(self, words, mode, max_words, pause_split=0.5):
-        self.words = words
-        self.groups = build_groups(words, mode, max_words, pause_split)
+        self.words = [w for w in words if not w.get("hidden")]  # hidden words never reach the screen
+        self.groups = build_groups(self.words, mode, max_words, pause_split)
         self.starts = [g["start"] for g in self.groups]
 
     def group_index_at(self, t):
@@ -365,9 +378,10 @@ class CaptionRenderer:
     """Draws captions onto a transparent RGBA layer. Caches the last layer so
     identical frames (same caption, same highlighted word) cost nothing."""
 
-    def __init__(self, style, font_info):
+    def __init__(self, style, font_info, voices=None):
         self.style = dict(style)
         self.font_info = font_info  # {"path":..., "index":...} or None
+        self.voices = copy.deepcopy(voices or [])
         self._fonts = {}
         self._last_key = None
         self._last_img = None
@@ -420,7 +434,31 @@ class CaptionRenderer:
         stroke = max(1, round(size * 0.07)) if st.get("outline") else 0
         pad_x, pad_y = round(size * 0.45), round(size * 0.3)
 
-        texts = [x["word"] for x in words]
+        # --- colours: per-voice highlight / whole line, optional name tag ---
+        text_rgb = tuple(st.get("text_color", [255, 255, 255]))
+        hl_rgb = tuple(st.get("highlight_color", [255, 255, 0]))
+        speaker = words[0].get("speaker") if words else None
+        voice = self.voices[speaker] if isinstance(speaker, int) and 0 <= speaker < len(self.voices) else None
+        voice_rgb = tuple(voice["color"]) if voice else None
+        mode = st.get("voice_colors", "highlight")
+        texts, colors = [], []
+        if voice and st.get("voice_names") and voice.get("name"):
+            texts.append(f"{voice['name']}:")
+            colors.append(voice_rgb)
+            active = None if active is None else active + 1
+        for k, x in enumerate(words):
+            texts.append(x["word"])
+            colors.append(None)
+        for k in range(len(texts)):
+            if colors[k] is not None:
+                continue
+            is_active = (k == active)
+            if voice_rgb and mode == "line":
+                colors[k] = tuple(int(c + (255 - c) * 0.55) for c in voice_rgb) if is_active else voice_rgb
+            elif voice_rgb and mode == "highlight":
+                colors[k] = voice_rgb if is_active else text_rgb
+            else:
+                colors[k] = hl_rgb if is_active else text_rgb
         widths = [font.getlength(s) for s in texts]
         space = font.getlength(" ")
 
@@ -475,12 +513,10 @@ class CaptionRenderer:
         if st.get("shadow"):
             self._draw_shadow(img, placed, texts, font, size, stroke)
 
-        text_rgb = tuple(st.get("text_color", [255, 255, 255]))
-        hl_rgb = tuple(st.get("highlight_color", [255, 255, 0]))
         outline_rgb = tuple(st.get("outline_color", [0, 0, 0]))
         d = ImageDraw.Draw(img)
         for x, baseline, k in placed:
-            color = hl_rgb if k == active else text_rgb
+            color = colors[k]
             d.text((x, baseline), texts[k], font=font, fill=color + (255,), anchor="ls",
                    stroke_width=stroke, stroke_fill=outline_rgb + (255,))
         return img
@@ -522,10 +558,15 @@ def subtitle_timestamp(t, vtt=False):
     return f"{hours:02}:{minutes:02}:{seconds:02}{sep}{ms:03}"
 
 
-def build_subtitles(track, vtt=False):
+def build_subtitles(track, vtt=False, voices=None):
     out = ["WEBVTT", ""] if vtt else []
+    voices = voices or []
     for n, group in enumerate(track.groups, 1):
         text = " ".join(track.words[i]["word"] for i in group["idx"])
+        speaker = track.words[group["idx"][0]].get("speaker")
+        if isinstance(speaker, int) and 0 <= speaker < len(voices) and voices[speaker].get("name"):
+            name = voices[speaker]["name"]
+            text = f"<v {name}>{text}" if vtt else f"[{name}] {text}"
         end = max(group["end"], group["start"] + 0.2)
         if not vtt:
             out.append(str(n))
@@ -654,6 +695,34 @@ class HardwareProbe(QThread):
         self.done.emit(message, gpu)
 
 
+class VoiceDetectWorker(QThread):
+    """Works out who is speaking (Voice 1, Voice 2...) using a small built-in voice model."""
+    status = Signal(str)
+    succeeded = Signal(list)
+    failed = Signal(str)
+
+    def __init__(self, video_path, audio_track, words, n_voices):
+        super().__init__()
+        self.video_path = video_path
+        self.audio_track = audio_track
+        self.words = [{"start": w["start"], "end": w["end"]} for w in words]
+        self.n_voices = n_voices
+
+    def run(self):
+        try:
+            import voice_detect
+            self.status.emit("Reading audio for voice detection...")
+            audio = load_audio_16k(self.video_path, self.audio_track)
+            encoder = voice_detect.VoiceEncoder(resource_path("voice_encoder.npz"))
+            labels = voice_detect.diarize(
+                encoder, audio, self.words, self.n_voices,
+                progress=lambda done, total: self.status.emit(f"Detecting voices... {done * 100 // max(total, 1)}%"))
+            self.succeeded.emit(list(labels))
+        except Exception as e:
+            log.exception("Voice detection failed")
+            self.failed.emit(str(e) or e.__class__.__name__)
+
+
 class TranscriptionWorker(QThread):
     succeeded = Signal(dict, str)
     failed = Signal(str)
@@ -728,7 +797,7 @@ class ExportWorker(QThread):
     failed = Signal(str)
     cancelled = Signal()
 
-    def __init__(self, video_path, info, out_file, export_mode, vertical, words, style, font_info):
+    def __init__(self, video_path, info, out_file, export_mode, vertical, words, style, font_info, voices=None):
         super().__init__()
         self.video_path = video_path
         self.info = info
@@ -738,6 +807,7 @@ class ExportWorker(QThread):
         self.words = copy.deepcopy(words)
         self.style = dict(style)
         self.font_info = font_info
+        self.voices = copy.deepcopy(voices or [])
         self._cancel = False
         self._procs = []
 
@@ -801,7 +871,7 @@ class ExportWorker(QThread):
         fps, fps_str = info["fps"], info["fps_str"]
         track = CaptionTrack(self.words, self.style["mode"], self.style["max_words"],
                              self.style.get("pause_split", 0.5))
-        renderer = CaptionRenderer(self.style, self.font_info)
+        renderer = CaptionRenderer(self.style, self.font_info, self.voices)
         if self.vertical:
             out_w, out_h = 1080, 1920
             vf = f"fps={fps_str},{cover_filter(out_w, out_h)}"
@@ -1060,6 +1130,12 @@ class MainWindow(QMainWindow):
         self.video_info = None
         self.frame_reader = None
         self.words = []
+        self.voices = []          # [{"name": "Voice 1", "color": [r, g, b]}, ...] - index = word["speaker"]
+        self._undo, self._redo = [], []
+        self._editor_lines = []
+        self._line_of_word = []
+        self._word_index = {}
+        self.voice_worker = None
         self.track = None
         self.renderer = None
         self.font_map = {}
@@ -1133,7 +1209,14 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+S"), self, activated=self.save_project)
         QShortcut(QKeySequence("Ctrl+I"), self, activated=self.load_video)
         QShortcut(QKeySequence(Qt.Key_Space), self, activated=self.toggle_play)
-        QShortcut(QKeySequence.Delete, self.caption_list, activated=self.delete_selected_words)
+        QShortcut(QKeySequence.Delete, self.caption_list, activated=self.toggle_hidden_selected)
+        QShortcut(QKeySequence("Shift+Delete"), self.caption_list, activated=self.delete_selected_words)
+        QShortcut(QKeySequence("Ctrl+Z"), self, activated=self.undo)
+        QShortcut(QKeySequence("Ctrl+Y"), self, activated=self.redo)
+        QShortcut(QKeySequence("Ctrl+F"), self, activated=lambda: self.search_box.setFocus())
+        for n in range(10):  # 1-9 = set voice, 0 = no voice
+            QShortcut(QKeySequence(str(n)), self.caption_list,
+                      activated=lambda n=n: self.assign_voice_selected(None if n == 0 else n - 1))
 
     # ------------------------------------------------------------------ styling
     def apply_stylesheet(self, colorblind_mode=False):
@@ -1173,8 +1256,14 @@ class MainWindow(QMainWindow):
             QComboBox {{ background-color: #151515; border: 1px solid #2D2D2D; border-radius: 5px; padding: 5px; color: #E0E0E0; }}
             QComboBox:on {{ border-color: {primary}; }}
             QComboBox QAbstractItemView {{ background-color: #151515; color: #E0E0E0; selection-background-color: {primary}; selection-color: {text_accent}; }}
-            QListWidget {{ background-color: #151515; border: 1px solid #2D2D2D; border-radius: 6px; padding: 5px; }}
-            QListWidget::item:selected {{ background-color: {primary}; color: {text_accent}; font-weight: bold; }}
+            QTreeWidget {{ background-color: #151515; border: 1px solid #2D2D2D; border-radius: 6px; padding: 4px; }}
+            QTreeWidget::item {{ padding: 3px 2px; }}
+            QTreeWidget::item:selected {{ background-color: {primary}; color: {text_accent}; }}
+            QHeaderView::section {{ background-color: #1E1E1E; color: #9A9A9A; border: none; padding: 4px 6px; font-weight: bold; }}
+            QMenu {{ background-color: #1E1E1E; border: 1px solid #2D2D2D; padding: 4px; }}
+            QMenu::item {{ padding: 6px 22px 6px 22px; }}
+            QMenu::item:selected {{ background-color: {primary}; color: {text_accent}; }}
+            QMenu::separator {{ height: 1px; background: #2D2D2D; margin: 4px 8px; }}
             QProgressBar {{ background-color: #151515; border: 1px solid #2D2D2D; border-radius: 4px; text-align: center; color: #EEEEEE; font-weight: bold; height: 20px; }}
             QProgressBar::chunk {{ background-color: {primary}; border-radius: 3px; }}
             QCheckBox {{ spacing: 8px; padding-top: 4px; padding-bottom: 4px; font-weight: bold; }}
@@ -1189,6 +1278,7 @@ class MainWindow(QMainWindow):
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
             QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: none; }}
             QSplitter::handle {{ background: transparent; }}
+            QSplitter::handle:vertical {{ height: 10px; }}
             QSplitter::handle:hover {{ background: {primary}; border-radius: 3px; }}
             QToolTip {{ background-color: #1E1E1E; color: #E0E0E0; border: 1px solid {primary}; }}
         """
@@ -1353,6 +1443,47 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.gen_btn)
         sidebar.addWidget(panel)
 
+        # Voices
+        panel, lay = self.make_panel("Voices")
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Number of voices"))
+        self.voice_count_combo = QComboBox()
+        self.voice_count_combo.addItem("Auto", userData=None)
+        for n in range(1, 9):
+            self.voice_count_combo.addItem(str(n), userData=n)
+        self.voice_count_combo.setToolTip("How many different people talk in this video. Setting it gives the best results.")
+        row.addWidget(self.voice_count_combo, 1)
+        lay.addLayout(row)
+        self.detect_btn = QPushButton("🎙 Detect Voices")
+        self.detect_btn.setToolTip("Find who is talking and give each voice its own colour")
+        self.detect_btn.clicked.connect(lambda: self.detect_voices())
+        lay.addWidget(self.detect_btn)
+        self.auto_detect_cb = QCheckBox("Detect voices after transcribing")
+        lay.addWidget(self.auto_detect_cb)
+        lay.addWidget(self.hint("Groups lines by who is speaking. Set the number of people for the best results, "
+                                "then rename the voices and fix mistakes in the transcript (select lines, press 1-9). "
+                                "Game characters usually get their own voice, so you can hide them all at once."))
+        self.voices_container = QWidget()
+        self.voices_box = QVBoxLayout(self.voices_container)
+        self.voices_box.setContentsMargins(0, 0, 0, 0)
+        self.voices_box.setSpacing(4)
+        lay.addWidget(self.voices_container)
+        self.add_voice_btn = QPushButton("+ Add Voice")
+        self.add_voice_btn.clicked.connect(lambda: self.add_voice())
+        lay.addWidget(self.add_voice_btn)
+        grid = QGridLayout()
+        self.voice_colors_btn = QPushButton()
+        self.voice_colors_btn.setToolTip("Off: normal highlight colour · Highlight: the spoken word uses the voice colour · "
+                                         "Whole line: the whole caption uses the voice colour")
+        self.voice_colors_btn.clicked.connect(self.toggle_voice_colors)
+        self.voice_names_btn = QPushButton()
+        self.voice_names_btn.setToolTip("Show the voice's name in front of each caption, e.g. \"Vyper: let's go\"")
+        self.voice_names_btn.clicked.connect(self.toggle_voice_names)
+        grid.addWidget(self.voice_colors_btn, 0, 0)
+        grid.addWidget(self.voice_names_btn, 0, 1)
+        lay.addLayout(grid)
+        sidebar.addWidget(panel)
+
         # Fonts
         panel, lay = self.make_panel("Font")
         self.font_search = QLineEdit()
@@ -1511,7 +1642,7 @@ class MainWindow(QMainWindow):
 
         self.preview = QLabel()
         self.preview.setAlignment(Qt.AlignCenter)
-        self.preview.setMinimumSize(400, 225)
+        self.preview.setMinimumSize(320, 180)
         self.preview.setStyleSheet("background-color: #0A0A0A; border: 2px solid #1E1E1E; border-radius: 8px;")
 
         transport = QHBoxLayout()
@@ -1551,19 +1682,68 @@ class MainWindow(QMainWindow):
         self.preview_hint = self.hint("")
         self.preview_hint.setAlignment(Qt.AlignCenter)
 
-        editor_title = QLabel("<b>Interactive Transcript Editor</b>")
-        editor_hint = self.hint("Click a word to jump there · Double-click to edit · Delete key removes selected words")
-        self.caption_list = QListWidget()
+        editor_bar = QHBoxLayout()
+        editor_title = QLabel("<b>Transcript Editor</b>")
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText("🔍 Search transcript (Ctrl+F)")
+        self.search_box.textChanged.connect(self.apply_search)
+        self.hide_btn = QPushButton("Hide / Show")
+        self.hide_btn.setToolTip("Hide the selected lines or words from the captions, or bring hidden ones back (Delete key)")
+        self.hide_btn.clicked.connect(self.toggle_hidden_selected)
+        self.voice_btn = QPushButton("Set Voice ▾")
+        self.voice_btn.setToolTip("Give the selected lines a voice (or press 1-9; 0 = no voice)")
+        self.voice_btn.clicked.connect(lambda: self.voice_menu().exec(self.voice_btn.mapToGlobal(self.voice_btn.rect().bottomLeft())))
+        self.undo_btn = QPushButton("↶")
+        self.undo_btn.setToolTip("Undo (Ctrl+Z)")
+        self.undo_btn.clicked.connect(self.undo)
+        self.redo_btn = QPushButton("↷")
+        self.redo_btn.setToolTip("Redo (Ctrl+Y)")
+        self.redo_btn.clicked.connect(self.redo)
+        editor_bar.addWidget(editor_title)
+        editor_bar.addWidget(self.search_box, 1)
+        for b in (self.hide_btn, self.voice_btn, self.undo_btn, self.redo_btn):
+            editor_bar.addWidget(b)
+        editor_hint = self.hint("Click a line to jump there · Double-click to edit · Del hides/shows · Shift+Del deletes · "
+                                "1-9 sets the voice · ▸ shows single words · Right-click for more")
+        self.caption_list = QTreeWidget()
+        self.caption_list.setColumnCount(3)
+        self.caption_list.setHeaderLabels(["Time", "Voice", "Caption"])
+        self.caption_list.header().setStretchLastSection(True)
+        self.caption_list.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.caption_list.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.caption_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.caption_list.setUniformRowHeights(True)
         self.caption_list.itemClicked.connect(self.seek_to_item)
         self.caption_list.itemDoubleClicked.connect(self.edit_caption)
+        self.caption_list.itemExpanded.connect(self.populate_line_children)
+        self.caption_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.caption_list.customContextMenuRequested.connect(self.show_editor_menu)
 
-        center.addWidget(self.preview, stretch=4)
-        center.addLayout(transport)
-        center.addWidget(self.preview_hint)
-        center.addWidget(editor_title)
-        center.addWidget(editor_hint)
-        center.addWidget(self.caption_list, stretch=1)
+        top = QWidget()
+        top_lay = QVBoxLayout(top)
+        top_lay.setContentsMargins(0, 0, 0, 0)
+        top_lay.addWidget(self.preview, 1)
+        top_lay.addLayout(transport)
+        top_lay.addWidget(self.preview_hint)
+        bottom = QWidget()
+        bottom_lay = QVBoxLayout(bottom)
+        bottom_lay.setContentsMargins(0, 4, 0, 0)
+        bottom_lay.addLayout(editor_bar)
+        bottom_lay.addWidget(editor_hint)
+        bottom_lay.addWidget(self.caption_list, 1)
+        # Draggable divider between the preview and the transcript editor
+        self.center_splitter = QSplitter(Qt.Vertical)
+        self.center_splitter.setChildrenCollapsible(False)
+        self.center_splitter.setHandleWidth(10)
+        self.center_splitter.addWidget(top)
+        self.center_splitter.addWidget(bottom)
+        self.center_splitter.setStretchFactor(0, 3)
+        self.center_splitter.setStretchFactor(1, 2)
+        saved_split = self.settings["ui"].get("center_split")
+        if saved_split:
+            QTimer.singleShot(0, lambda: self.center_splitter.setSizes(saved_split))
+        self.center_splitter.splitterMoved.connect(lambda *_: self.save_ui_settings())
+        center.addWidget(self.center_splitter, 1)
 
         center_widget = QWidget()
         center_widget.setLayout(center)
@@ -1590,6 +1770,8 @@ class MainWindow(QMainWindow):
             self.font_search, self.preset_combo, self.preset_save_btn, self.preset_del_btn,
             self.text_btn, self.hl_btn, self.outline_color_btn, self.bg_btn, self.outline_btn, self.shadow_btn,
             self.pos_btn, self.mode_btn, self.size_spin.stepper_box, self.export_mode_btn, self.caption_list,
+            self.hide_btn, self.voice_btn, self.voice_count_combo, self.auto_detect_cb, self.voices_container,
+            self.add_voice_btn, self.voice_colors_btn, self.voice_names_btn,
         ]
 
     # ------------------------------------------------------------------ control state
@@ -1603,6 +1785,9 @@ class MainWindow(QMainWindow):
         self.font_combo.setEnabled(idle and fonts_ready)
         self.fav_btn.setEnabled(idle and fonts_ready)
         self.gen_btn.setEnabled(idle and has_video)
+        self.detect_btn.setEnabled(idle and has_video and has_words)
+        self.undo_btn.setEnabled(idle and bool(self._undo))
+        self.redo_btn.setEnabled(idle and bool(self._redo))
         self.save_proj_btn.setEnabled(idle and (has_video or has_words))
         self.export_btn.setEnabled(idle and has_video and has_words)
         self.subs_btn.setEnabled(idle and has_words)
@@ -1639,6 +1824,8 @@ class MainWindow(QMainWindow):
         ui["vertical"] = self.vertical_checkbox.isChecked()
         if hasattr(self, "splitter") and self.splitter.sizes()[0] > 0:
             ui["sidebar_width"] = self.splitter.sizes()[0]
+        if hasattr(self, "center_splitter") and min(self.center_splitter.sizes()) > 0:
+            ui["center_split"] = self.center_splitter.sizes()
         if hasattr(self, "volume_slider"):
             ui["volume"] = self.volume_slider.value()
             ui["muted"] = self.is_muted()
@@ -1650,6 +1837,9 @@ class MainWindow(QMainWindow):
         self.bg_btn.setText("Background: ON" if st["background"] else "Background: OFF")
         self.outline_btn.setText("Outline: ON" if st["outline"] else "Outline: OFF")
         self.shadow_btn.setText("Drop Shadow: ON" if st.get("shadow") else "Drop Shadow: OFF")
+        self.voice_colors_btn.setText({"off": "Voice colours: Off", "highlight": "Voice colours: Highlight",
+                                       "line": "Voice colours: Whole line"}.get(st.get("voice_colors", "highlight")))
+        self.voice_names_btn.setText("Name tags: ON" if st.get("voice_names") else "Name tags: OFF")
         self.pos_btn.setText(f"Align: {st['position'].title()}")
         self.mode_btn.setText({"sentence": "Mode: Sentence", "auto": "Mode: Auto (pauses)",
                                "word": "Mode: Word"}.get(st["mode"], "Mode: Sentence"))
@@ -1674,6 +1864,8 @@ class MainWindow(QMainWindow):
         self.renderer = None
         if rebuild_track:
             self.rebuild_track()
+            if self.words:
+                self.rebuild_caption_list()
         self.settings["style"] = dict(self.style)
         save_settings(self.settings)
         if not self.preview_running:
@@ -1681,10 +1873,11 @@ class MainWindow(QMainWindow):
 
     def get_renderer(self):
         if self.renderer is None:
-            self.renderer = CaptionRenderer(self.style, self.font_map.get(self.style.get("font")))
+            self.renderer = CaptionRenderer(self.style, self.font_map.get(self.style.get("font")), self.voices)
         return self.renderer
 
     def rebuild_track(self):
+        self._word_index = {id(w): i for i, w in enumerate(self.words)}
         self.track = CaptionTrack(self.words, self.style["mode"], self.style["max_words"],
                              self.style.get("pause_split", 0.5)) if self.words else None
         self.renderer = None
@@ -1881,6 +2074,9 @@ class MainWindow(QMainWindow):
             return
         if self.open_video(video_path):
             self.words = []
+            self.voices = []
+            self.reset_history()
+            self.rebuild_voice_panel()
             self.rebuild_track()
             self.rebuild_caption_list()
             self.dirty = False
@@ -1972,8 +2168,10 @@ class MainWindow(QMainWindow):
                 words.append({"word": text, "start": start, "end": max(start, end)})
         words.sort(key=lambda x: x["start"])
         self.words = words
+        self.reset_history()
         self.rebuild_track()
         self.rebuild_caption_list()
+        self.rebuild_voice_panel()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100 if words else 0)
         self.set_busy(None)
@@ -1984,6 +2182,8 @@ class MainWindow(QMainWindow):
             self.label.setText("No speech was detected")
         self.preview_time = 0.0
         self.refresh_preview()
+        if words and self.auto_detect_cb.isChecked():
+            QTimer.singleShot(0, lambda: self.detect_voices(ask=False))
 
     def on_transcription_failure(self, error_message):
         self.progress_bar.setRange(0, 100)
@@ -1993,53 +2193,507 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Transcription failed", error_message)
 
     # ------------------------------------------------------------------ transcript editor
+    # ------------------------------------------------------------------ transcript editor
+    GREY = QColor(110, 110, 110)
+
+    def voice_icon(self, speaker):
+        pixmap = QPixmap(12, 12)
+        if isinstance(speaker, int) and 0 <= speaker < len(self.voices):
+            pixmap.fill(QColor(*self.voices[speaker]["color"]))
+        else:
+            pixmap.fill(Qt.transparent)
+        return QIcon(pixmap)
+
+    def voice_name(self, speaker):
+        if isinstance(speaker, int) and 0 <= speaker < len(self.voices):
+            return self.voices[speaker]["name"]
+        return ""
+
+    @staticmethod
+    def strike(item, on):
+        for col in range(3):
+            font = item.font(col)
+            font.setStrikeOut(on)
+            item.setFont(col, font)
+            item.setForeground(col, MainWindow.GREY if on else QColor(224, 224, 224))
+
     def rebuild_caption_list(self):
-        self.caption_list.clear()
-        for w in self.words:
-            self.caption_list.addItem(QListWidgetItem(f"{fmt_clock(w['start'], True)}    {w['word']}"))
+        """Transcript as caption lines (expand a line to edit single words)."""
+        tree = self.caption_list
+        expanded = set()
+        for i in range(tree.topLevelItemCount()):
+            item = tree.topLevelItem(i)
+            if item.isExpanded():
+                data = item.data(0, Qt.UserRole)
+                if data and data[1] < len(self._editor_lines) and self._editor_lines[data[1]]:
+                    first = self._editor_lines[data[1]][0]
+                    if first < len(self.words):
+                        expanded.add(id(self.words[first]))
+        scroll = tree.verticalScrollBar().value()
+        tree.blockSignals(True)
+        tree.clear()
+        groups = build_groups(self.words, self.style["mode"], self.style["max_words"],
+                              self.style.get("pause_split", 0.5)) if self.words else []
+        self._editor_lines = [g["idx"] for g in groups]
+        self._line_of_word = [0] * len(self.words)
+        items = []
+        for li, idxs in enumerate(self._editor_lines):
+            for i in idxs:
+                self._line_of_word[i] = li
+            item = QTreeWidgetItem()
+            item.setData(0, Qt.UserRole, ("line", li))
+            self.fill_line_item(item, idxs)
+            if len(idxs) > 1:
+                item.addChild(QTreeWidgetItem(["", "", "…"]))  # filled in when expanded
+            items.append(item)
+        tree.addTopLevelItems(items)
+        for item, idxs in zip(items, self._editor_lines):
+            if id(self.words[idxs[0]]) in expanded:
+                item.setExpanded(True)
+                self.populate_line_children(item)
+        tree.blockSignals(False)
+        tree.verticalScrollBar().setValue(scroll)
+        self.apply_search()
         self._last_list_row = -1
 
-    def seek_to_item(self, item):
-        row = self.caption_list.row(item)
-        if 0 <= row < len(self.words):
-            self.preview_time = self.words[row]["start"] + 0.01
-            self.sync_play_position()
-            self.refresh_preview()
-
-    def edit_caption(self, item):
-        row = self.caption_list.row(item)
-        if not 0 <= row < len(self.words):
-            return
-        new, ok = QInputDialog.getText(self, "Edit Caption Word",
-                                       "Text (leave empty to remove the word):", text=self.words[row]["word"])
-        if not ok:
-            return
-        new = new.strip()
-        if new:
-            self.words[row]["word"] = new
-            item.setText(f"{fmt_clock(self.words[row]['start'], True)}    {new}")
+    def fill_line_item(self, item, idxs):
+        visible = [i for i in idxs if not self.words[i].get("hidden")]
+        hidden = len(idxs) - len(visible)
+        if visible:
+            text = " ".join(self.words[i]["word"] for i in visible)
+            if hidden:
+                text += f"    ({hidden} hidden)"
         else:
-            del self.words[row]
-            self.rebuild_caption_list()
+            text = " ".join(self.words[i]["word"] for i in idxs)
+        speaker = self.words[idxs[0]].get("speaker")
+        item.setText(0, fmt_clock(self.words[idxs[0]]["start"], True))
+        item.setText(1, self.voice_name(speaker))
+        item.setIcon(1, self.voice_icon(speaker))
+        item.setText(2, text)
+        self.strike(item, not visible)
+
+    def populate_line_children(self, item):
+        data = item.data(0, Qt.UserRole)
+        if not data or data[0] != "line" or data[1] >= len(self._editor_lines):
+            return
+        if item.childCount() and item.child(0).data(0, Qt.UserRole):
+            return  # already filled
+        self.caption_list.blockSignals(True)
+        item.takeChildren()
+        for i in self._editor_lines[data[1]]:
+            w = self.words[i]
+            child = QTreeWidgetItem([fmt_clock(w["start"], True), self.voice_name(w.get("speaker")), w["word"]])
+            child.setIcon(1, self.voice_icon(w.get("speaker")))
+            child.setData(0, Qt.UserRole, ("word", i))
+            self.strike(child, bool(w.get("hidden")))
+            item.addChild(child)
+        self.caption_list.blockSignals(False)
+
+    def selected_word_indices(self):
+        chosen = set()
+        for item in self.caption_list.selectedItems():
+            data = item.data(0, Qt.UserRole)
+            if not data:
+                continue
+            if data[0] == "line" and data[1] < len(self._editor_lines):
+                chosen.update(self._editor_lines[data[1]])
+            elif data[0] == "word" and data[1] < len(self.words):
+                chosen.add(data[1])
+        return sorted(chosen)
+
+    def apply_search(self, *_):
+        needle = self.search_box.text().lower().strip()
+        for li in range(self.caption_list.topLevelItemCount()):
+            item = self.caption_list.topLevelItem(li)
+            if not needle:
+                item.setHidden(False)
+                continue
+            text = " ".join(self.words[i]["word"] for i in self._editor_lines[li]).lower()
+            item.setHidden(needle not in text and needle not in item.text(1).lower())
+
+    def seek_to_item(self, item, *_):
+        data = item.data(0, Qt.UserRole)
+        if not data:
+            return
+        if data[0] == "line" and data[1] < len(self._editor_lines):
+            idxs = self._editor_lines[data[1]]
+            visible = [i for i in idxs if not self.words[i].get("hidden")] or idxs
+            t = self.words[visible[0]]["start"]
+        elif data[0] == "word" and data[1] < len(self.words):
+            t = self.words[data[1]]["start"]
+        else:
+            return
+        self.preview_time = t + 0.01
+        self.sync_play_position()
+        self.refresh_preview()
+
+    # ---- undo / redo
+    def push_undo(self):
+        self._undo.append((copy.deepcopy(self.words), copy.deepcopy(self.voices)))
+        del self._undo[:-60]
+        self._redo.clear()
+
+    def _restore(self, snapshot):
+        self.words, self.voices = snapshot
+        self.renderer = None
+        self.rebuild_voice_panel()
         self.after_words_edited()
+
+    def undo(self):
+        if self.busy or not self._undo:
+            return
+        self._redo.append((copy.deepcopy(self.words), copy.deepcopy(self.voices)))
+        self._restore(self._undo.pop())
+        self.label.setText("Undone")
+
+    def redo(self):
+        if self.busy or not self._redo:
+            return
+        self._undo.append((copy.deepcopy(self.words), copy.deepcopy(self.voices)))
+        self._restore(self._redo.pop())
+        self.label.setText("Redone")
+
+    def reset_history(self):
+        self._undo.clear()
+        self._redo.clear()
+
+    # ---- editing actions
+    def toggle_hidden_selected(self):
+        idxs = self.selected_word_indices()
+        if self.busy or not idxs:
+            return
+        self.push_undo()
+        hide = not all(self.words[i].get("hidden") for i in idxs)
+        for i in idxs:
+            if hide:
+                self.words[i]["hidden"] = True
+            else:
+                self.words[i].pop("hidden", None)
+        self.after_words_edited()
+        self.label.setText(f"{'Hid' if hide else 'Restored'} {len(idxs)} word(s)")
 
     def delete_selected_words(self):
-        if self.busy:
+        idxs = self.selected_word_indices()
+        if self.busy or not idxs:
             return
-        rows = sorted({self.caption_list.row(i) for i in self.caption_list.selectedItems()}, reverse=True)
-        if not rows:
+        if QMessageBox.question(self, "Delete permanently?",
+                                f"Delete {len(idxs)} word(s) from the transcript?\n"
+                                "(Hide keeps them so you can bring them back. Undo also works.)") != QMessageBox.Yes:
             return
-        for row in rows:
-            del self.words[row]
-        self.rebuild_caption_list()
+        self.push_undo()
+        for i in reversed(idxs):
+            del self.words[i]
         self.after_words_edited()
 
-    def after_words_edited(self):
+    def edit_caption(self, item, *_):
+        data = item.data(0, Qt.UserRole)
+        if self.busy or not data:
+            return
+        if data[0] == "word":
+            i = data[1]
+            new, ok = QInputDialog.getText(self, "Edit Word", "Text (leave empty to delete the word):",
+                                           text=self.words[i]["word"])
+            if not ok:
+                return
+            self.push_undo()
+            new = new.strip()
+            if new:
+                self.words[i]["word"] = new
+            else:
+                del self.words[i]
+            self.after_words_edited()
+            return
+        idxs = self._editor_lines[data[1]]
+        visible = [i for i in idxs if not self.words[i].get("hidden")]
+        if not visible:
+            return
+        old = " ".join(self.words[i]["word"] for i in visible)
+        new, ok = QInputDialog.getText(self, "Edit Line", "Fix the words in this line:", text=old)
+        if not ok or new.strip() == old:
+            return
+        self.push_undo()
+        new_words = new.split()
+        if len(new_words) == len(visible):
+            for i, text in zip(visible, new_words):
+                self.words[i]["word"] = text
+        else:  # different word count: spread the new words evenly over the line's time
+            start, end = self.words[visible[0]]["start"], self.words[visible[-1]]["end"]
+            speaker = self.words[visible[0]].get("speaker")
+            for i in reversed(visible):
+                del self.words[i]
+            step = (end - start) / max(len(new_words), 1)
+            for n, text in enumerate(new_words):
+                w = {"word": text, "start": start + n * step, "end": start + (n + 1) * step}
+                if speaker is not None:
+                    w["speaker"] = speaker
+                self.words.append(w)
+            self.words.sort(key=lambda w: w["start"])
+        self.after_words_edited()
+
+    # ---- voices
+    def voice_template(self, n):
+        saved = self.settings.get("voices", [])
+        if n < len(saved) and saved[n].get("name"):
+            return {"name": saved[n]["name"], "color": list(saved[n].get("color", VOICE_PALETTE[n % 8]))}
+        return default_voice(n)
+
+    def remember_voices(self):
+        saved = self.settings.setdefault("voices", [])
+        for n, v in enumerate(self.voices):
+            if n < len(saved):
+                saved[n] = copy.deepcopy(v)
+            else:
+                saved.append(copy.deepcopy(v))
+        save_settings(self.settings)
+
+    def ensure_voices(self, count):
+        while len(self.voices) < count:
+            self.voices.append(self.voice_template(len(self.voices)))
+
+    def voice_menu(self):
+        menu = QMenu(self)
+        none = menu.addAction("No voice  (0)")
+        none.triggered.connect(lambda: self.assign_voice_selected(None))
+        for n, v in enumerate(self.voices):
+            act = menu.addAction(self.voice_icon(n), f"{v['name']}  ({n + 1})" if n < 9 else v["name"])
+            act.triggered.connect(lambda _=False, n=n: self.assign_voice_selected(n))
+        menu.addSeparator()
+        new = menu.addAction("+ New voice")
+        new.triggered.connect(lambda: self.assign_voice_selected(len(self.voices)))
+        return menu
+
+    def assign_voice_selected(self, voice):
+        idxs = self.selected_word_indices()
+        if self.busy or not idxs:
+            return
+        self.push_undo()
+        if voice is not None:
+            self.ensure_voices(voice + 1)
+        for i in idxs:
+            if voice is None:
+                self.words[i].pop("speaker", None)
+            else:
+                self.words[i]["speaker"] = voice
+        self.renderer = None
+        self.rebuild_voice_panel()
+        self.after_words_edited()
+        self.label.setText(f"{len(idxs)} word(s) set to {self.voice_name(voice) or 'no voice'}")
+
+    def show_editor_menu(self, pos):
+        item = self.caption_list.itemAt(pos)
+        if self.busy or item is None:
+            return
+        if not item.isSelected():
+            self.caption_list.setCurrentItem(item)
+        menu = QMenu(self)
+        menu.addAction("Hide / Show  (Del)").triggered.connect(self.toggle_hidden_selected)
+        menu.addAction("Delete permanently  (Shift+Del)").triggered.connect(self.delete_selected_words)
+        voice_sub = self.voice_menu()
+        voice_sub.setTitle("Set voice")
+        menu.addMenu(voice_sub)
+        menu.addAction("Edit...").triggered.connect(lambda: self.edit_caption(item))
+        idxs = self.selected_word_indices()
+        speakers = {self.words[i].get("speaker") for i in idxs} - {None}
+        if len(speakers) == 1:
+            v = speakers.pop()
+            menu.addSeparator()
+            menu.addAction(f"Hide every line from {self.voice_name(v)}").triggered.connect(lambda: self.set_voice_hidden(v, True))
+            menu.addAction(f"Show every line from {self.voice_name(v)}").triggered.connect(lambda: self.set_voice_hidden(v, False))
+        menu.addSeparator()
+        menu.addAction("Expand all").triggered.connect(self.caption_list.expandAll)
+        menu.addAction("Collapse all").triggered.connect(self.caption_list.collapseAll)
+        menu.exec(self.caption_list.viewport().mapToGlobal(pos))
+
+    def set_voice_hidden(self, voice, hide):
+        idxs = [i for i, w in enumerate(self.words) if w.get("speaker") == voice]
+        if self.busy or not idxs:
+            return
+        self.push_undo()
+        for i in idxs:
+            if hide:
+                self.words[i]["hidden"] = True
+            else:
+                self.words[i].pop("hidden", None)
+        self.rebuild_voice_panel()
+        self.after_words_edited()
+        self.label.setText(f"{'Hid' if hide else 'Showed'} every line from {self.voice_name(voice)}")
+
+    def add_voice(self):
+        if self.busy:
+            return
+        self.push_undo()
+        self.ensure_voices(len(self.voices) + 1)
+        self.rebuild_voice_panel()
+        self.after_words_edited(rebuild_list=False)
+
+    def remove_voice(self, n):
+        if self.busy or not 0 <= n < len(self.voices):
+            return
+        self.push_undo()
+        for w in self.words:
+            sp = w.get("speaker")
+            if sp == n:
+                w.pop("speaker", None)
+            elif isinstance(sp, int) and sp > n:
+                w["speaker"] = sp - 1
+        del self.voices[n]
+        self.renderer = None
+        self.rebuild_voice_panel()
+        self.after_words_edited()
+
+    def rename_voice(self, n, edit):
+        name = edit.text().strip() or f"Voice {n + 1}"
+        if n < len(self.voices) and self.voices[n]["name"] != name:
+            self.push_undo()
+            self.voices[n]["name"] = name
+            self.remember_voices()
+            self.renderer = None
+            self.after_words_edited()
+
+    def pick_voice_color(self, n):
+        if self.busy or n >= len(self.voices):
+            return
+        color = QColorDialog.getColor(QColor(*self.voices[n]["color"]), self, f"Colour for {self.voices[n]['name']}")
+        if color.isValid():
+            self.push_undo()
+            self.voices[n]["color"] = list(color.getRgb()[:3])
+            self.remember_voices()
+            self.renderer = None
+            self.rebuild_voice_panel()
+            self.after_words_edited()
+
+    def rebuild_voice_panel(self):
+        while self.voices_box.count():
+            widget = self.voices_box.takeAt(0).widget()
+            if widget:
+                widget.deleteLater()
+        counts = {}
+        hidden_all = {}
+        for w in self.words:
+            sp = w.get("speaker")
+            if isinstance(sp, int):
+                counts[sp] = counts.get(sp, 0) + 1
+                hidden_all[sp] = hidden_all.get(sp, True) and bool(w.get("hidden"))
+        for n, v in enumerate(self.voices):
+            row = QWidget()
+            lay = QHBoxLayout(row)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(4)
+            color_btn = QPushButton()
+            color_btn.setFixedWidth(34)
+            self.update_button_color(color_btn, v["color"])
+            color_btn.setToolTip("Change this voice's colour")
+            color_btn.clicked.connect(lambda _=False, n=n: self.pick_voice_color(n))
+            name = QLineEdit(v["name"])
+            name.setToolTip(f"Name for voice {n + 1} (press {n + 1} in the transcript to give lines this voice)")
+            name.editingFinished.connect(lambda n=n, e=name: self.rename_voice(n, e))
+            count = QLabel(str(counts.get(n, 0)))
+            count.setObjectName("HintLabel")
+            count.setToolTip("Words with this voice")
+            is_hidden = hidden_all.get(n, False) and counts.get(n, 0) > 0
+            eye = QPushButton("Show" if is_hidden else "Hide")
+            eye.setToolTip("Hide or show every line from this voice (e.g. game characters)")
+            eye.clicked.connect(lambda _=False, n=n, h=is_hidden: self.set_voice_hidden(n, not h))
+            remove = QPushButton("✕")
+            remove.setFixedWidth(30)
+            remove.setToolTip("Remove this voice (its lines keep their text, just no voice)")
+            remove.clicked.connect(lambda _=False, n=n: self.remove_voice(n))
+            for wdg in (color_btn, name, count, eye, remove):
+                lay.addWidget(wdg)
+            lay.setStretch(1, 1)
+            self.voices_box.addWidget(row)
+
+    def toggle_voice_colors(self):
+        order = ["off", "highlight", "line"]
+        cur = self.style.get("voice_colors", "highlight")
+        self.style["voice_colors"] = order[(order.index(cur) + 1) % 3] if cur in order else "highlight"
+        self.sync_style_widgets()
+        self.on_style_changed()
+
+    def toggle_voice_names(self):
+        self.style["voice_names"] = not self.style.get("voice_names", False)
+        self.sync_style_widgets()
+        self.on_style_changed()
+
+    def detect_voices(self, ask=True):
+        if self.busy or not self.words or not self.video_path:
+            return
+        if ask and any("speaker" in w for w in self.words) and QMessageBox.question(
+                self, "Detect voices again?", "This replaces the voices given to every line. Continue?") != QMessageBox.Yes:
+            return
+        self.pause_preview()
+        self.progress_bar.setRange(0, 0)
+        self.set_busy("voices")
+        self.voice_worker = VoiceDetectWorker(self.video_path, self.selected_track(), self.words,
+                                              self.voice_count_combo.currentData())
+        self.voice_worker.status.connect(self.label.setText)
+        self.voice_worker.succeeded.connect(self.on_voices_detected)
+        self.voice_worker.failed.connect(self.on_voice_detect_failed)
+        self.voice_worker.start()
+
+    def on_voices_detected(self, labels):
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(100)
+        self.set_busy(None)
+        if len(labels) != len(self.words):
+            self.label.setText("Voice detection result didn't match the transcript - try again")
+            return
+        self.push_undo()
+        for w, sp in zip(self.words, labels):
+            w["speaker"] = int(sp)
+        count = (max(labels) + 1) if labels else 0
+        self.ensure_voices(count)
+        if self.style.get("voice_colors") == "off":
+            self.style["voice_colors"] = "highlight"
+            self.sync_style_widgets()
+        self.renderer = None
+        self.rebuild_voice_panel()
+        self.after_words_edited()
+        self.label.setText(f"Found {count} voice(s). Rename them in the Voices panel and fix any mistakes "
+                           f"in the transcript (select lines, press 1-9).")
+
+    def on_voice_detect_failed(self, message):
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.set_busy(None)
+        self.label.setText("Voice detection failed")
+        QMessageBox.critical(self, "Voice detection failed", message)
+
+    def after_words_edited(self, rebuild_list=True):
         self.dirty = True
         self.rebuild_track()
+        if rebuild_list:
+            self.rebuild_caption_list()
+        self.rebuild_voice_counts()
         self.update_controls()
         if not self.preview_running:
             self.refresh_preview()
+
+    def rebuild_voice_counts(self):
+        # cheap refresh of the per-voice word counts / Hide-Show labels
+        if self.voices_box.count() != len(self.voices):
+            self.rebuild_voice_panel()
+            return
+        counts, hidden_all = {}, {}
+        for w in self.words:
+            sp = w.get("speaker")
+            if isinstance(sp, int):
+                counts[sp] = counts.get(sp, 0) + 1
+                hidden_all[sp] = hidden_all.get(sp, True) and bool(w.get("hidden"))
+        for n in range(len(self.voices)):
+            row = self.voices_box.itemAt(n).widget()
+            if row is None:
+                continue
+            lay = row.layout()
+            lay.itemAt(2).widget().setText(str(counts.get(n, 0)))
+            is_hidden = hidden_all.get(n, False) and counts.get(n, 0) > 0
+            eye = lay.itemAt(3).widget()
+            eye.setText("Show" if is_hidden else "Hide")
+            try:
+                eye.clicked.disconnect()
+            except Exception:
+                pass
+            eye.clicked.connect(lambda _=False, n=n, h=is_hidden: self.set_voice_hidden(n, not h))
 
     # ------------------------------------------------------------------ preview
     def duration(self):
@@ -2218,16 +2872,20 @@ class MainWindow(QMainWindow):
         self.seek_slider.setValue(int(self.preview_time * 1000))
         self._updating_slider = False
 
-        if self.preview_running and self.track:  # follow along in the transcript list
+        if self.preview_running and self.track:  # follow along in the transcript
             gi = self.track.group_index_at(self.preview_time)
             if gi >= 0:
-                idx = self.track.groups[gi]["idx"]
-                row = max((i for i in idx if self.words[i]["start"] <= self.preview_time), default=idx[0])
-                if row != self._last_list_row:
-                    self._last_list_row = row
-                    self.caption_list.blockSignals(True)
-                    self.caption_list.setCurrentRow(row)
-                    self.caption_list.blockSignals(False)
+                first = self.track.words[self.track.groups[gi]["idx"][0]]
+                wi = self._word_index.get(id(first))
+                if wi is not None and wi < len(self._line_of_word):
+                    line = self._line_of_word[wi]
+                    if line != self._last_list_row and line < self.caption_list.topLevelItemCount():
+                        self._last_list_row = line
+                        item = self.caption_list.topLevelItem(line)
+                        self.caption_list.blockSignals(True)
+                        self.caption_list.setCurrentItem(item)
+                        self.caption_list.scrollToItem(item)
+                        self.caption_list.blockSignals(False)
 
     @staticmethod
     def pil_to_qpixmap(img):
@@ -2288,7 +2946,7 @@ class MainWindow(QMainWindow):
         self.set_busy("export")
         self.export_worker = ExportWorker(
             self.video_path, self.video_info, out_file, self.export_mode, vertical,
-            self.words, self.style, self.font_map.get(self.style.get("font")))
+            self.words, self.style, self.font_map.get(self.style.get("font")), self.voices)
         self.export_worker.progress.connect(self.on_export_progress)
         self.export_worker.succeeded.connect(self.on_export_success)
         self.export_worker.failed.connect(self.on_export_failure)
@@ -2368,7 +3026,7 @@ class MainWindow(QMainWindow):
             out_file += ".srt"
         try:
             with open(out_file, "w", encoding="utf-8") as f:
-                f.write(build_subtitles(self.track, vtt=vtt))
+                f.write(build_subtitles(self.track, vtt=vtt, voices=self.voices))
             self.label.setText(f"Subtitles saved: {os.path.basename(out_file)}")
         except Exception as e:
             QMessageBox.critical(self, "Couldn't save subtitles", str(e))
@@ -2387,7 +3045,7 @@ class MainWindow(QMainWindow):
                 path += ".bcs.json"
         data = {
             "app": APP_NAME, "version": APP_VERSION,
-            "video_path": self.video_path, "words": self.words, "style": self.style,
+            "video_path": self.video_path, "words": self.words, "style": self.style, "voices": self.voices,
             "export_mode": self.export_mode, "vertical": self.vertical_checkbox.isChecked(),
             "audio_track": self.selected_track(),
         }
@@ -2411,8 +3069,20 @@ class MainWindow(QMainWindow):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            words = [{"word": str(w["word"]).strip(), "start": float(w["start"]), "end": float(w["end"])}
-                     for w in data.get("words", []) if str(w.get("word", "")).strip()]
+            words = []
+            for w in data.get("words", []):
+                text = str(w.get("word", "")).strip()
+                if not text:
+                    continue
+                item = {"word": text, "start": float(w["start"]), "end": float(w["end"])}
+                if w.get("hidden"):
+                    item["hidden"] = True
+                if isinstance(w.get("speaker"), int):
+                    item["speaker"] = w["speaker"]
+                words.append(item)
+            voices = [{"name": str(v.get("name") or f"Voice {n + 1}"),
+                       "color": [int(c) for c in v.get("color", VOICE_PALETTE[n % 8])][:3]}
+                      for n, v in enumerate(data.get("voices", []) or [])]
         except Exception as e:
             QMessageBox.critical(self, "Couldn't open project", f"That file isn't a valid caption project.\n\n{e}")
             return
@@ -2435,6 +3105,11 @@ class MainWindow(QMainWindow):
         self.vertical_checkbox.blockSignals(False)
         self.apply_export_mode_labels()
         self.words = words
+        self.voices = voices
+        self.ensure_voices(max((w["speaker"] for w in words if "speaker" in w), default=-1) + 1)
+        self.reset_history()
+        self.renderer = None
+        self.rebuild_voice_panel()
         self.rebuild_track()
         self.rebuild_caption_list()
         self.refresh_fonts(keep_style_font=True)
@@ -2454,7 +3129,7 @@ class MainWindow(QMainWindow):
                 return
             self.export_worker.cancel()
             self.export_worker.wait(10000)
-        elif self.busy == "transcribe":
+        elif self.busy in ("transcribe", "voices"):
             if QMessageBox.question(self, "Transcription running", "Captions are still being generated. Quit anyway?") != QMessageBox.Yes:
                 event.ignore()
                 return

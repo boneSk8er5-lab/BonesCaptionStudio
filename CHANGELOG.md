@@ -1,5 +1,26 @@
 # Bones Caption Studio – Changelog
 
+## 6.6.0 (beta)
+**Voices**
+- New **Voices** panel: give each person their own name and colour (Voice 1, Voice 2... rename to Bones, Vyper...).
+- **Detect Voices** works out who is talking automatically with a small built-in voice model
+  (2.6 MB, no account, works offline). Set **Number of voices** for the best results. Optional
+  "Detect voices after transcribing".
+- **Voice colours**: Highlight (the spoken word uses the voice's colour), Whole line, or Off.
+- **Name tags**: show "Name:" in front of each caption.
+- A new caption starts whenever the voice changes. SRT/VTT exports include voice names.
+- **Hide / Show** every line from one voice in one click (great for game characters).
+- Voice names and colours are remembered for next time and saved in projects.
+
+**Transcript editor**
+- Shows caption lines with time and voice; expand a line (▸) to edit single words.
+- **Hide / Show** lines or words (Delete key); hidden text stays in the project, greyed out.
+- **Shift+Delete** deletes permanently. **Undo / Redo** (Ctrl+Z / Ctrl+Y) for every edit.
+- Press **1-9** to give the selected lines a voice (0 = no voice), or use **Set Voice**.
+- Double-click a line to fix its words; right-click menu for everything.
+- **Search** the transcript (Ctrl+F).
+- Draggable divider between the preview and the transcript.
+
 ## 6.5.0 (beta)
 - Drop shadow controls: **Shadow angle** (any direction, in 15° steps), **Shadow distance**
   (0 = right behind the text, for a glow look), **Shadow softness** (0% = hard, crisp edge)

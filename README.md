@@ -19,7 +19,9 @@ The Whisper *Base* model is included, so it works offline out of the box.
 
 - Whisper transcription with word-level timing, GPU-accelerated on NVIDIA cards (Tiny → Medium/Turbo models, language picker)
 - Caption modes: **Sentence**, **Auto** (new caption at pauses), **Word**
-- Word highlight, text/highlight/outline colours, background box, text size, top/center/bottom alignment, line wrapping
+- **Voices**: automatic speaker detection (small built-in model, offline), per-voice colours and name tags, hide a whole voice in one click
+- Transcript editor: hide/restore lines or words, undo/redo, search, voice shortcuts (1-9)
+- Word highlight, drop shadow (angle, distance, softness, strength), text/highlight/outline colours, background box, text size, top/center/bottom alignment, line wrapping
 - Live preview with sound, seek bar, and a clickable transcript you can edit
 - Exports:
   - transparent **ProRes 4444 .mov** overlay for any video editor
