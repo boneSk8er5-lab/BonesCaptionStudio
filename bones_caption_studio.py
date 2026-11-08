@@ -1,6 +1,7 @@
 # =====================================================================
 # BONES CAPTION STUDIO
-# VERSION: 6.3.1
+# VERSION: 6.4.0
+#   - 6.4: soft drop shadow option with adjustable strength
 #   - 6.3.1: sidebar no longer cut off; draggable divider between settings and preview
 #   - 6.3: GPU detection shown in the app; portable mode (portable.txt), bundled Whisper models folder, beta build number
 #   - 6.2.1: number boxes get real -/+ buttons (Windows 11 arrows were unclickable)
@@ -13,7 +14,7 @@
 #   - Save / open projects (.bcs.json), style presets
 #   - Settings + log live in %APPDATA%\BonesCaptionStudio
 # =====================================================================
-APP_VERSION = "6.3.1"
+APP_VERSION = "6.4.0"
 APP_NAME = "Bones Caption Studio"
 
 import sys
@@ -43,7 +44,7 @@ import threading
 import warnings
 from logging.handlers import RotatingFileHandler
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QPushButton, QFileDialog, QLabel,
     QHBoxLayout, QVBoxLayout, QGridLayout, QComboBox, QLineEdit, QInputDialog,
@@ -286,6 +287,8 @@ DEFAULT_STYLE = {
     "max_words": 8,
     "pause_split": 0.5,     # Auto mode: start a new caption after a pause this long (seconds)
     "size": 100,            # percent
+    "shadow": False,        # soft drop shadow behind the text
+    "shadow_strength": 70,  # shadow opacity, percent
 }
 HOLD_GAP = 0.5  # keep a caption on screen through pauses shorter than this (stops flicker)
 
@@ -439,20 +442,51 @@ class CaptionRenderer:
                 [left - pad_x, top - pad_y, left + block_w + pad_x, top + block_h + pad_y],
                 radius=round(size * 0.3), fill=(0, 0, 0, 160))
 
-        text_rgb = tuple(st.get("text_color", [255, 255, 255]))
-        hl_rgb = tuple(st.get("highlight_color", [255, 255, 0]))
-        outline_rgb = tuple(st.get("outline_color", [0, 0, 0]))
+        # where every word goes
+        placed = []
         y = top
         for indices, line_w in lines:
             x = (w - line_w) / 2
             baseline = y + stroke + ascent
             for k in indices:
-                color = hl_rgb if k == active else text_rgb
-                d.text((x, baseline), texts[k], font=font, fill=color + (255,), anchor="ls",
-                       stroke_width=stroke, stroke_fill=outline_rgb + (255,))
+                placed.append((x, baseline, k))
                 x += widths[k] + space
             y += line_h + gap
+
+        if st.get("shadow"):
+            self._draw_shadow(img, placed, texts, font, size, stroke)
+
+        text_rgb = tuple(st.get("text_color", [255, 255, 255]))
+        hl_rgb = tuple(st.get("highlight_color", [255, 255, 0]))
+        outline_rgb = tuple(st.get("outline_color", [0, 0, 0]))
+        d = ImageDraw.Draw(img)
+        for x, baseline, k in placed:
+            color = hl_rgb if k == active else text_rgb
+            d.text((x, baseline), texts[k], font=font, fill=color + (255,), anchor="ls",
+                   stroke_width=stroke, stroke_fill=outline_rgb + (255,))
         return img
+
+    def _draw_shadow(self, img, placed, texts, font, size, stroke):
+        """Soft drop shadow: the text shape, offset down-right, blurred, darkened onto the layer."""
+        w, h = img.size
+        offset = max(1, round(size * 0.06))
+        blur = max(1, round(size * 0.07))
+        strength = max(0, min(100, int(self.style.get("shadow_strength", 70)))) / 100.0
+        mask = Image.new("L", (w, h), 0)
+        md = ImageDraw.Draw(mask)
+        for x, baseline, k in placed:
+            md.text((x + offset, baseline + offset), texts[k], font=font, fill=255, anchor="ls",
+                    stroke_width=stroke, stroke_fill=255)
+        bbox = mask.getbbox()
+        if not bbox:
+            return
+        pad = blur * 3
+        region = (max(0, bbox[0] - pad), max(0, bbox[1] - pad), min(w, bbox[2] + pad), min(h, bbox[3] + pad))
+        alpha = mask.crop(region).filter(ImageFilter.GaussianBlur(blur))
+        alpha = alpha.point(lambda v: int(v * strength))
+        shadow = Image.new("RGBA", alpha.size, (0, 0, 0, 0))
+        shadow.putalpha(alpha)
+        img.alpha_composite(shadow, dest=region[:2])
 
 
 def subtitle_timestamp(t, vtt=False):
@@ -1341,6 +1375,10 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.outline_btn, 0, 1)
         grid.addWidget(self.pos_btn, 1, 0)
         grid.addWidget(self.mode_btn, 1, 1)
+        self.shadow_btn = QPushButton()
+        self.shadow_btn.setToolTip("Soft drop shadow behind the text (works with or without the background box)")
+        self.shadow_btn.clicked.connect(self.toggle_shadow)
+        grid.addWidget(self.shadow_btn, 2, 0, 1, 2)
         lay.addLayout(grid)
 
         grid = QGridLayout()
@@ -1359,6 +1397,14 @@ class MainWindow(QMainWindow):
         self.pause_spin.setToolTip("Auto mode: when nobody speaks for this long, the next words start a new caption")
         self.pause_spin.valueChanged.connect(self.on_pause_split_changed)
         grid.addWidget(self.stepper(self.pause_spin), 2, 1)
+        self.shadow_label = QLabel("Shadow strength")
+        grid.addWidget(self.shadow_label, 3, 0)
+        self.shadow_spin = QSpinBox()
+        self.shadow_spin.setRange(10, 100)
+        self.shadow_spin.setSingleStep(10)
+        self.shadow_spin.setSuffix(" %")
+        self.shadow_spin.valueChanged.connect(self.on_shadow_strength_changed)
+        grid.addWidget(self.stepper(self.shadow_spin), 3, 1)
         grid.addWidget(QLabel("Text size"), 1, 0)
         self.size_spin = QSpinBox()
         self.size_spin.setRange(40, 250)
@@ -1489,7 +1535,7 @@ class MainWindow(QMainWindow):
         self._lockables = [
             self.import_btn, self.open_proj_btn, self.model_combo, self.lang_combo, self.accel_combo,
             self.font_search, self.preset_combo, self.preset_save_btn, self.preset_del_btn,
-            self.text_btn, self.hl_btn, self.outline_color_btn, self.bg_btn, self.outline_btn,
+            self.text_btn, self.hl_btn, self.outline_color_btn, self.bg_btn, self.outline_btn, self.shadow_btn,
             self.pos_btn, self.mode_btn, self.size_spin.stepper_box, self.export_mode_btn, self.caption_list,
         ]
 
@@ -1510,6 +1556,8 @@ class MainWindow(QMainWindow):
         self.vertical_checkbox.setEnabled(idle and self.export_mode == "merge")
         self.max_words_spin.stepper_box.setEnabled(idle and self.style["mode"] in ("sentence", "auto"))
         self.pause_spin.stepper_box.setEnabled(idle and self.style["mode"] == "auto")
+        self.shadow_spin.stepper_box.setEnabled(idle and bool(self.style.get("shadow")))
+        self.shadow_label.setEnabled(idle and bool(self.style.get("shadow")))
         self.pause_label.setEnabled(idle and self.style["mode"] == "auto")
         self.cancel_btn.setVisible(self.busy == "export")
         self.drop_zone.setAcceptDrops(idle)
@@ -1545,11 +1593,13 @@ class MainWindow(QMainWindow):
         st = self.style
         self.bg_btn.setText("Background: ON" if st["background"] else "Background: OFF")
         self.outline_btn.setText("Outline: ON" if st["outline"] else "Outline: OFF")
+        self.shadow_btn.setText("Drop Shadow: ON" if st.get("shadow") else "Drop Shadow: OFF")
         self.pos_btn.setText(f"Align: {st['position'].title()}")
         self.mode_btn.setText({"sentence": "Mode: Sentence", "auto": "Mode: Auto (pauses)",
                                "word": "Mode: Word"}.get(st["mode"], "Mode: Sentence"))
         for spin, value in ((self.max_words_spin, int(st["max_words"])), (self.size_spin, int(st["size"])),
-                            (self.pause_spin, float(st.get("pause_split", 0.5)))):
+                            (self.pause_spin, float(st.get("pause_split", 0.5))),
+                            (self.shadow_spin, int(st.get("shadow_strength", 70)))):
             spin.blockSignals(True)
             spin.setValue(value)
             spin.blockSignals(False)
@@ -1586,6 +1636,15 @@ class MainWindow(QMainWindow):
     def toggle_background(self):
         self.style["background"] = not self.style["background"]
         self.sync_style_widgets()
+        self.on_style_changed()
+
+    def toggle_shadow(self):
+        self.style["shadow"] = not self.style.get("shadow", False)
+        self.sync_style_widgets()
+        self.on_style_changed()
+
+    def on_shadow_strength_changed(self, value):
+        self.style["shadow_strength"] = value
         self.on_style_changed()
 
     def toggle_outline(self):

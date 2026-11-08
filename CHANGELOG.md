@@ -1,5 +1,11 @@
 # Bones Caption Studio – Changelog
 
+## 6.4.0 (beta)
+- New **Drop Shadow** option: a soft shadow behind the caption text, sized to the text.
+  Works with or without the background box and outline, and shows in the preview, the
+  transparent .mov overlay and full-video exports.
+- **Shadow strength** setting (10-100%). Both are saved in style presets and projects.
+
 ## 6.3.1 (beta)
 - Fixed: the settings sidebar was cut off on the right (Save Project, preset Save/Delete,
   Outline, Mode and more were hidden). Dropdowns no longer stretch to their longest entry,
