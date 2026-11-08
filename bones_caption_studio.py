@@ -1,6 +1,7 @@
 # =====================================================================
 # BONES CAPTION STUDIO
-# VERSION: 6.4.0
+# VERSION: 6.5.0
+#   - 6.5: shadow angle/distance/softness, strength up to 300%; pick which audio track to caption
 #   - 6.4: soft drop shadow option with adjustable strength
 #   - 6.3.1: sidebar no longer cut off; draggable divider between settings and preview
 #   - 6.3: GPU detection shown in the app; portable mode (portable.txt), bundled Whisper models folder, beta build number
@@ -14,7 +15,7 @@
 #   - Save / open projects (.bcs.json), style presets
 #   - Settings + log live in %APPDATA%\BonesCaptionStudio
 # =====================================================================
-APP_VERSION = "6.4.0"
+APP_VERSION = "6.5.0"
 APP_NAME = "Bones Caption Studio"
 
 import sys
@@ -225,6 +226,19 @@ def cover_filter(w, h):
     return f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1"
 
 
+def describe_audio_track(n, stream):
+    tags = stream.get("tags", {}) or {}
+    tags = {k.lower(): v for k, v in tags.items()}
+    handler = (tags.get("handler_name") or "").strip()
+    if handler.lower() in ("soundhandler", "core media audio", "gpac isomedia handler", "isomedia handler"):
+        handler = ""  # generic filler names some muxers write
+    title = (tags.get("title") or tags.get("name") or handler or "").strip()  # MKV: title, MP4: handler_name
+    channels = {1: "mono", 2: "stereo"}.get(stream.get("channels"), f"{stream.get('channels', '?')} ch")
+    language = (tags.get("language") or "").strip()
+    extra = ", ".join(x for x in (channels, language if language not in ("", "und") else "") if x)
+    return f"Track {n + 1}" + (f": {title}" if title else "") + (f" ({extra})" if extra else "")
+
+
 def probe_video(path):
     result = run_cmd([FFPROBE_BIN, "-v", "error", "-show_format", "-show_streams", "-of", "json", path])
     if result.returncode != 0:
@@ -269,6 +283,8 @@ def probe_video(path):
         "width": width or 1920, "height": height or 1080,
         "fps": fps, "fps_str": fps_str, "duration": duration,
         "has_audio": any(s.get("codec_type") == "audio" for s in streams),
+        "audio_tracks": [describe_audio_track(n, s) for n, s in
+                         enumerate(s for s in streams if s.get("codec_type") == "audio")],
     }
 
 
@@ -288,7 +304,10 @@ DEFAULT_STYLE = {
     "pause_split": 0.5,     # Auto mode: start a new caption after a pause this long (seconds)
     "size": 100,            # percent
     "shadow": False,        # soft drop shadow behind the text
-    "shadow_strength": 70,  # shadow opacity, percent
+    "shadow_strength": 70,  # 10-300 %: above 100 the soft shadow gets denser and darker
+    "shadow_angle": 45,     # direction the shadow falls: 0 = right, 90 = down, 180 = left, 270 = up
+    "shadow_distance": 6,   # how far the shadow sits from the text, % of the text size
+    "shadow_softness": 50,  # 0 = hard edge, 100 = very soft
 }
 HOLD_GAP = 0.5  # keep a caption on screen through pauses shorter than this (stops flicker)
 
@@ -467,23 +486,28 @@ class CaptionRenderer:
         return img
 
     def _draw_shadow(self, img, placed, texts, font, size, stroke):
-        """Soft drop shadow: the text shape, offset down-right, blurred, darkened onto the layer."""
+        """Drop shadow: the text shape moved by angle/distance, blurred by softness, darkened onto the layer."""
         w, h = img.size
-        offset = max(1, round(size * 0.06))
-        blur = max(1, round(size * 0.07))
-        strength = max(0, min(100, int(self.style.get("shadow_strength", 70)))) / 100.0
+        st = self.style
+        distance = size * max(0, min(100, int(st.get("shadow_distance", 6)))) / 100.0
+        angle = math.radians(int(st.get("shadow_angle", 45)) % 360)
+        dx, dy = round(math.cos(angle) * distance), round(math.sin(angle) * distance)
+        blur = size * 0.14 * max(0, min(100, int(st.get("shadow_softness", 50)))) / 100.0
+        strength = max(10, min(300, int(st.get("shadow_strength", 70)))) / 100.0
         mask = Image.new("L", (w, h), 0)
         md = ImageDraw.Draw(mask)
         for x, baseline, k in placed:
-            md.text((x + offset, baseline + offset), texts[k], font=font, fill=255, anchor="ls",
+            md.text((x + dx, baseline + dy), texts[k], font=font, fill=255, anchor="ls",
                     stroke_width=stroke, stroke_fill=255)
         bbox = mask.getbbox()
         if not bbox:
             return
-        pad = blur * 3
+        pad = int(blur * 3) + 1
         region = (max(0, bbox[0] - pad), max(0, bbox[1] - pad), min(w, bbox[2] + pad), min(h, bbox[3] + pad))
-        alpha = mask.crop(region).filter(ImageFilter.GaussianBlur(blur))
-        alpha = alpha.point(lambda v: int(v * strength))
+        alpha = mask.crop(region)
+        if blur >= 0.5:  # softness 0 = crisp, hard-edged shadow
+            alpha = alpha.filter(ImageFilter.GaussianBlur(blur))
+        alpha = alpha.point(lambda v: min(255, int(v * strength)))
         shadow = Image.new("RGBA", alpha.size, (0, 0, 0, 0))
         shadow.putalpha(alpha)
         img.alpha_composite(shadow, dest=region[:2])
@@ -595,10 +619,10 @@ _MODEL_CACHE = {}
 _MODEL_LOCK = threading.Lock()
 
 
-def load_audio_16k(path):
-    """Decode audio ourselves (no console flash, clear errors) and hand Whisper a numpy array."""
+def load_audio_16k(path, track=0):
+    """Decode one audio track ourselves (no console flash, clear errors) and hand Whisper a numpy array."""
     import numpy as np
-    result = run_cmd([FFMPEG_BIN, "-nostdin", "-v", "error", "-i", path, "-vn",
+    result = run_cmd([FFMPEG_BIN, "-nostdin", "-v", "error", "-i", path, "-vn", "-map", f"0:a:{int(track)}",
                       "-ac", "1", "-ar", "16000", "-f", "s16le", "-"])
     if result.returncode != 0:
         raise RuntimeError("Could not read the audio track:\n" + tail_text(result.stderr))
@@ -636,8 +660,9 @@ class TranscriptionWorker(QThread):
     fallback_warning = Signal(str)
     status = Signal(str)
 
-    def __init__(self, video_path, accel, model_name, language):
+    def __init__(self, video_path, accel, model_name, language, audio_track=0):
         super().__init__()
+        self.audio_track = audio_track
         self.video_path = video_path
         self.accel = accel
         self.model_name = model_name
@@ -673,7 +698,7 @@ class TranscriptionWorker(QThread):
     def run(self):
         try:
             self.status.emit("Reading audio...")
-            audio = load_audio_16k(self.video_path)
+            audio = load_audio_16k(self.video_path, self.audio_track)
             device = self.resolve_device()
             try:
                 result = self.transcribe(audio, device)
@@ -817,7 +842,7 @@ class ExportWorker(QThread):
                         "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
             write_cmd = [FFMPEG_BIN, "-nostdin", "-y", "-v", "error",
                          "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{out_w}x{out_h}", "-r", fps_str, "-i", "-",
-                         "-i", self.video_path, "-map", "0:v:0", "-map", "1:a:0?",
+                         "-i", self.video_path, "-map", "0:v:0", "-map", "1:a?",
                          "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
                          "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", self.out_file]
             frame_size = out_w * out_h * 3
@@ -1070,6 +1095,7 @@ class MainWindow(QMainWindow):
                 self.audio_player = QMediaPlayer(self)
                 self.audio_player.setAudioOutput(self.audio_output)
                 self.audio_player.errorOccurred.connect(self.on_audio_error)
+                self.audio_player.tracksChanged.connect(lambda: self.apply_preview_track())
             except Exception as e:
                 log.warning(f"Preview audio unavailable: {e}")
                 self.audio_player = None
@@ -1311,6 +1337,16 @@ class MainWindow(QMainWindow):
         self.gen_btn.clicked.connect(self.generate)
         lay.addWidget(self.model_combo)
         lay.addWidget(self.hint("Models marked 'downloads on first use' need internet once (75 MB – 1.5 GB)."))
+        self.track_label = self.hint("Audio track to caption. If you record your mic on its own track "
+                                     "(OBS: Settings › Output › Recording › Audio Track), pick it here "
+                                     "to caption only your voice and not the game.")
+        self.track_combo = QComboBox()
+        self.compact_combo(self.track_combo)
+        self.track_combo.currentIndexChanged.connect(self.on_track_changed)
+        lay.addWidget(self.track_combo)
+        lay.addWidget(self.track_label)
+        self.track_combo.hide()
+        self.track_label.hide()
         lay.addWidget(self.lang_combo)
         lay.addWidget(self.accel_combo)
         lay.addWidget(self.hardware_status_lbl)
@@ -1397,14 +1433,31 @@ class MainWindow(QMainWindow):
         self.pause_spin.setToolTip("Auto mode: when nobody speaks for this long, the next words start a new caption")
         self.pause_spin.valueChanged.connect(self.on_pause_split_changed)
         grid.addWidget(self.stepper(self.pause_spin), 2, 1)
-        self.shadow_label = QLabel("Shadow strength")
-        grid.addWidget(self.shadow_label, 3, 0)
-        self.shadow_spin = QSpinBox()
-        self.shadow_spin.setRange(10, 100)
-        self.shadow_spin.setSingleStep(10)
-        self.shadow_spin.setSuffix(" %")
-        self.shadow_spin.valueChanged.connect(self.on_shadow_strength_changed)
-        grid.addWidget(self.stepper(self.shadow_spin), 3, 1)
+        # Drop shadow settings (active when Drop Shadow is ON)
+        self.shadow_controls = []
+        for row, (key, label, lo, hi, step, suffix, wrap, tip) in enumerate((
+                ("shadow_strength", "Shadow strength", 10, 300, 10, " %", False,
+                 "How dark the shadow is. Over 100% makes a soft shadow denser and darker."),
+                ("shadow_angle", "Shadow angle", 0, 345, 15, "°", True,
+                 "Direction the shadow falls: 0° right, 45° down-right, 90° down, 180° left, 270° up."),
+                ("shadow_distance", "Shadow distance", 0, 30, 1, "", False,
+                 "How far the shadow sits from the text (scales with the text size). 0 = right behind it."),
+                ("shadow_softness", "Shadow softness", 0, 100, 10, " %", False,
+                 "0% = hard, crisp edge. Higher = softer, more blurred shadow."),
+        ), start=3):
+            caption = QLabel(label)
+            caption.setToolTip(tip)
+            spin = QSpinBox()
+            spin.setRange(lo, hi)
+            spin.setSingleStep(step)
+            spin.setSuffix(suffix)
+            spin.setWrapping(wrap)
+            spin.setToolTip(tip)
+            spin.valueChanged.connect(lambda value, k=key: self.on_style_number(k, value))
+            grid.addWidget(caption, row, 0)
+            grid.addWidget(self.stepper(spin), row, 1)
+            self.shadow_controls.append((key, caption, spin))
+        self.shadow_spin = self.shadow_controls[0][2]
         grid.addWidget(QLabel("Text size"), 1, 0)
         self.size_spin = QSpinBox()
         self.size_spin.setRange(40, 250)
@@ -1556,8 +1609,11 @@ class MainWindow(QMainWindow):
         self.vertical_checkbox.setEnabled(idle and self.export_mode == "merge")
         self.max_words_spin.stepper_box.setEnabled(idle and self.style["mode"] in ("sentence", "auto"))
         self.pause_spin.stepper_box.setEnabled(idle and self.style["mode"] == "auto")
-        self.shadow_spin.stepper_box.setEnabled(idle and bool(self.style.get("shadow")))
-        self.shadow_label.setEnabled(idle and bool(self.style.get("shadow")))
+        shadow_on = idle and bool(self.style.get("shadow"))
+        for _key, caption, spin in self.shadow_controls:
+            spin.stepper_box.setEnabled(shadow_on)
+            caption.setEnabled(shadow_on)
+        self.track_combo.setEnabled(idle)
         self.pause_label.setEnabled(idle and self.style["mode"] == "auto")
         self.cancel_btn.setVisible(self.busy == "export")
         self.drop_zone.setAcceptDrops(idle)
@@ -1598,8 +1654,8 @@ class MainWindow(QMainWindow):
         self.mode_btn.setText({"sentence": "Mode: Sentence", "auto": "Mode: Auto (pauses)",
                                "word": "Mode: Word"}.get(st["mode"], "Mode: Sentence"))
         for spin, value in ((self.max_words_spin, int(st["max_words"])), (self.size_spin, int(st["size"])),
-                            (self.pause_spin, float(st.get("pause_split", 0.5))),
-                            (self.shadow_spin, int(st.get("shadow_strength", 70)))):
+                            (self.pause_spin, float(st.get("pause_split", 0.5)))) + tuple(
+                (spin, int(st.get(key, DEFAULT_STYLE[key]))) for key, _c, spin in self.shadow_controls):
             spin.blockSignals(True)
             spin.setValue(value)
             spin.blockSignals(False)
@@ -1643,8 +1699,8 @@ class MainWindow(QMainWindow):
         self.sync_style_widgets()
         self.on_style_changed()
 
-    def on_shadow_strength_changed(self, value):
-        self.style["shadow_strength"] = value
+    def on_style_number(self, key, value):
+        self.style[key] = value
         self.on_style_changed()
 
     def toggle_outline(self):
@@ -1850,6 +1906,7 @@ class MainWindow(QMainWindow):
         self.frame_reader = VideoFrameReader(video_path, info)
         self.preview_time = 0.0
         self.load_preview_audio(video_path, info["has_audio"])
+        self.populate_tracks(info.get("audio_tracks", []))
         self.label.setText(f"Loaded: {os.path.basename(video_path)}")
         self.update_slider_range()
         if not info["has_audio"]:
@@ -1886,7 +1943,7 @@ class MainWindow(QMainWindow):
         self.set_busy("transcribe")
         self.transcription_worker = TranscriptionWorker(
             self.video_path, self.accel_combo.currentData(),
-            self.model_combo.currentData(), self.lang_combo.currentData())
+            self.model_combo.currentData(), self.lang_combo.currentData(), self.selected_track())
         self.transcription_worker.succeeded.connect(self.on_transcription_success)
         self.transcription_worker.failed.connect(self.on_transcription_failure)
         self.transcription_worker.fallback_warning.connect(self.show_fallback_dialog)
@@ -2063,6 +2120,39 @@ class MainWindow(QMainWindow):
             self.audio_ok = True
         else:
             self.audio_player.setSource(QUrl())
+
+    def populate_tracks(self, tracks, select=0):
+        self.track_combo.blockSignals(True)
+        self.track_combo.clear()
+        for i, label in enumerate(tracks):
+            self.track_combo.addItem(label, userData=i)
+        if 0 <= select < len(tracks):
+            self.track_combo.setCurrentIndex(select)
+        self.track_combo.blockSignals(False)
+        many = len(tracks) > 1
+        self.track_combo.setVisible(many)
+        self.track_label.setVisible(many)
+        self.apply_preview_track()
+
+    def selected_track(self):
+        data = self.track_combo.currentData()
+        return int(data) if data is not None else 0
+
+    def on_track_changed(self, *_):
+        self.apply_preview_track()
+        if self.words:
+            self.label.setText(f"Audio track {self.selected_track() + 1} selected - Generate Captions to re-caption it")
+
+    def apply_preview_track(self):
+        """Let the preview play the chosen track too, so you hear what will be captioned."""
+        player = self.audio_player
+        if player is None or not hasattr(player, "setActiveAudioTrack"):
+            return
+        try:
+            if len(player.audioTracks()) > self.selected_track():
+                player.setActiveAudioTrack(self.selected_track())
+        except Exception as e:
+            log.debug(f"Couldn't switch preview audio track: {e}")
 
     def audio_active(self):
         return self.audio_player is not None and self.audio_ok
@@ -2299,6 +2389,7 @@ class MainWindow(QMainWindow):
             "app": APP_NAME, "version": APP_VERSION,
             "video_path": self.video_path, "words": self.words, "style": self.style,
             "export_mode": self.export_mode, "vertical": self.vertical_checkbox.isChecked(),
+            "audio_track": self.selected_track(),
         }
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -2338,6 +2429,7 @@ class MainWindow(QMainWindow):
 
         self.style.update({k: v for k, v in data.get("style", {}).items() if k in DEFAULT_STYLE})
         self.export_mode = data.get("export_mode", self.export_mode)
+        self.populate_tracks(self.video_info.get("audio_tracks", []), int(data.get("audio_track", 0) or 0))
         self.vertical_checkbox.blockSignals(True)
         self.vertical_checkbox.setChecked(bool(data.get("vertical", False)) and self.export_mode == "merge")
         self.vertical_checkbox.blockSignals(False)

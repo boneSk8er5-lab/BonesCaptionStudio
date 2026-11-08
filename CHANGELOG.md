@@ -1,5 +1,14 @@
 # Bones Caption Studio – Changelog
 
+## 6.5.0 (beta)
+- Drop shadow controls: **Shadow angle** (any direction, in 15° steps), **Shadow distance**
+  (0 = right behind the text, for a glow look), **Shadow softness** (0% = hard, crisp edge)
+  and **Shadow strength** now goes up to 300% for a denser, darker shadow.
+- **Caption only your voice**: if a video has more than one audio track (e.g. OBS recording
+  your mic on its own track), pick which track to caption in the Transcription panel. The
+  preview plays that track, track names from OBS show up, and the choice is saved in projects.
+- Full-video exports keep every audio track from the original recording.
+
 ## 6.4.0 (beta)
 - New **Drop Shadow** option: a soft shadow behind the caption text, sized to the text.
   Works with or without the background box and outline, and shows in the preview, the
