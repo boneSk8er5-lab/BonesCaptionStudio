@@ -49,6 +49,7 @@ MinVersion=10.0
 OutputDir={#OutputDir}
 OutputBaseFilename={#OutputName}
 SetupIconFile=..\BCS.ico
+LicenseFile=..\LICENSE.txt
 UninstallDisplayIcon={app}\{#AppExe}
 UninstallDisplayName={#AppName} ({#Edition})
 Compression=lzma2/normal

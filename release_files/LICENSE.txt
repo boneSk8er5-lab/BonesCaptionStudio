@@ -1,0 +1,40 @@
+Bones Caption Studio
+Copyright (c) 2024-2026 Bones_84 (GitHub: boneSk8er5-lab). All rights reserved.
+
+This software, including its source code, compiled program files, installers,
+graphics, icons and documentation (together, the "Software"), is the property
+of the copyright holder and is protected by copyright law.
+
+PERMITTED
+You may download the official release from the copyright holder's GitHub page
+and install and use it on your own computers for making captions for your own
+videos, including videos you publish or earn money from. Captions, subtitles
+and videos you create with the Software belong to you.
+
+NOT PERMITTED WITHOUT WRITTEN PERMISSION FROM THE COPYRIGHT HOLDER
+- Copying, re-uploading, sharing, selling, renting or otherwise distributing
+  the Software or any part of it (including through other websites, file
+  hosts, mirrors or bundles).
+- Copying, modifying, translating or building other software from the source
+  code, in whole or in part.
+- Reverse engineering, decompiling or disassembling the Software, except where
+  the law expressly allows it.
+- Removing, disabling or getting around any licence, activation or feature
+  restriction in the Software.
+- Removing or changing this notice or any copyright notice in the Software.
+
+Viewing the source code on GitHub does not give you any of these rights.
+
+THIRD-PARTY COMPONENTS
+The Software includes open-source components (such as OpenAI Whisper, PyTorch,
+Qt for Python, FFmpeg and Resemblyzer). Those components stay under their own
+licences, listed in THIRD_PARTY_NOTICES.txt, and nothing here limits your
+rights under those licences.
+
+NO WARRANTY
+The Software is provided "as is", without warranty of any kind. The copyright
+holder is not liable for any damage, data loss or other problems arising from
+its use.
+
+For permission requests, contact the copyright holder through
+https://github.com/boneSk8er5-lab

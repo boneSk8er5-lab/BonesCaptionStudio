@@ -48,6 +48,10 @@ release.bat              # beta test build: both portable editions into %USERPRO
 release_final.bat        # final release: portable zips + installers (installers need the free Inno Setup 6)
 ```
 
+## License
+
+Copyright © Bones_84. **All rights reserved.** You may download and use the official release, but you may not copy, redistribute, modify or reuse the program or its source code without written permission. See [`LICENSE.txt`](LICENSE.txt). Open-source components keep their own licenses (`THIRD_PARTY_NOTICES.txt`).
+
 ## Credits
 
 Made by Bones_84. Built on OpenAI Whisper, PyTorch, Qt for Python and FFmpeg; see `THIRD_PARTY_NOTICES.txt`.
