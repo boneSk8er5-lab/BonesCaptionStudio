@@ -1,5 +1,33 @@
 # Bones Caption Studio – Changelog
 
+## 6.7.0
+**Projects & menus**
+- New **menu bar**: File (New, Open, Open Recent, Save, Save As, Import Video, Export, Exit),
+  Edit (Undo, Redo, Find, Hide/Show, Set Voice) and Help (Keyboard Shortcuts, Logs folder,
+  Check for Updates, About).
+- The title bar shows the project name and a ● when there are unsaved changes.
+- Projects now save as **.bcsproj** files (older .bcs.json projects still open).
+- **Open Recent** remembers your last 10 projects.
+- **Autosave & crash recovery**: unsaved work is saved every 90 seconds and offered back if the app
+  closes unexpectedly.
+- Open a project by dropping it on the window or double-clicking it in File Explorer
+  (installer, or Help › "Open .bcsproj files with Bones Caption Studio" for the portable version).
+- The window opens at the size and position you left it (never off-screen).
+
+**Captions & export**
+- **Timing offset** (−5 to +5 s) moves all captions earlier or later.
+- **Caption height** fine-tunes how high or low captions sit.
+- **Crop** slider for vertical (1080×1920) exports: choose which part of the picture to keep.
+- **Progress bars** for model downloads and transcription, and a **Cancel** button.
+- Checks free disk space before exporting and warns about very large overlay files.
+- Clear message if FFmpeg is missing.
+- Help › **Reset settings to defaults** (keeps your fonts, presets, voices and recent projects).
+- Help › **Check for Updates**.
+
+**Releases**
+- No longer a beta. Each release has a portable zip **and a Windows installer** (per-user, no
+  admin rights, Start menu shortcut, optional desktop shortcut).
+
 ## 6.6.0 (beta)
 **Voices**
 - New **Voices** panel: give each person their own name and colour (Voice 1, Voice 2... rename to Bones, Vyper...).

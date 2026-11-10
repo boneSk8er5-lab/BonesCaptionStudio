@@ -2,11 +2,11 @@
 
 Auto-captions for your videos: transcribe speech with OpenAI Whisper, style animated word-highlight captions, and export them as a transparent overlay, a burned-in video, or subtitle files.
 
-**Status: beta.** Windows 10/11 (64-bit). Portable: no installer needed.
+Windows 10/11 (64-bit). Available as a portable zip (nothing to install) or a regular installer.
 
 ## Download
 
-Grab the latest release from **[Releases](../../releases)**, extract it, and run `BonesCaptionStudio.exe`:
+Grab the latest release from **[Releases](../../releases)**. Either run the `…_Setup.exe` installer, or extract the portable zip and run `BonesCaptionStudio.exe`:
 
 - **CPU edition** (`…_Windows_x64_CPU.zip`): works on every PC, smallest download.
 - **GPU edition** (`…_Windows_x64_GPU-NVIDIA`): much faster on NVIDIA graphics cards, and falls back to the CPU elsewhere. If it's split into parts, download them all and run the included `JOIN_….bat`, or open the `.001` file with 7-Zip/WinRAR.
@@ -27,7 +27,10 @@ The Whisper *Base* model is included, so it works offline out of the box.
   - transparent **ProRes 4444 .mov** overlay for any video editor
   - **MP4** with captions burned in (optional 1080×1920 vertical for TikTok/Shorts/Reels)
   - **SRT / VTT** subtitles
-- Style presets, save/open projects, any installed font with favourites
+- Projects (`.bcsproj`): File menu with New / Open / Open Recent / Save As, autosave and crash recovery, double-click a project to open it
+- Caption timing offset and height fine-tuning, crop position for vertical exports
+- Progress for model downloads and transcription, with Cancel
+- Style presets, any installed font with favourites, Reset settings to defaults, Check for Updates
 - Red-green colour-blind friendly theme option
 
 ## Reporting bugs
@@ -41,7 +44,8 @@ Needs Windows and Python 3.10+. Put `ffmpeg.exe` and `ffprobe.exe` next to `bone
 ```
 setup_build_tools.bat    # one time: private CPU + GPU build environments (your normal Python isn't touched)
 run_from_source.bat      # run the app from source
-release.bat              # build both portable editions into %USERPROFILE%\BonesCaptionStudio_Releases
+release.bat              # beta test build: both portable editions into %USERPROFILE%\BonesCaptionStudio_Releases
+release_final.bat        # final release: portable zips + installers (installers need the free Inno Setup 6)
 ```
 
 ## Credits

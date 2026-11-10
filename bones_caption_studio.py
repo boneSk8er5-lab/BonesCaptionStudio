@@ -1,6 +1,7 @@
 # =====================================================================
 # BONES CAPTION STUDIO
-# VERSION: 6.6.0
+# VERSION: 6.7.0
+#   - 6.7: menu bar, recent projects, autosave/recovery, progress + cancel, timing offset, caption height, crop position, .bcsproj
 #   - 6.6: voices (manual + automatic detection) with per-voice colours/name tags; transcript editor with lines, hide/restore, search, undo
 #   - 6.5: shadow angle/distance/softness, strength up to 300%; pick which audio track to caption
 #   - 6.4: soft drop shadow option with adjustable strength
@@ -13,10 +14,10 @@
 #   - SRT / VTT subtitle export
 #   - Line wrapping, text outline, text size, top/center/bottom alignment
 #   - Seek bar + timestamps, click a word to jump, double-click to edit
-#   - Save / open projects (.bcs.json), style presets
+#   - Save / open projects (.bcsproj), style presets
 #   - Settings + log live in %APPDATA%\BonesCaptionStudio
 # =====================================================================
-APP_VERSION = "6.6.0"
+APP_VERSION = "6.7.0"
 APP_NAME = "Bones Caption Studio"
 
 import sys
@@ -36,13 +37,17 @@ if sys.platform == "win32" and getattr(sys, "frozen", False):
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import bisect
+import re
 import copy
 import json
 import logging
 import math
+import shutil
 import subprocess
+import time
 import tempfile
 import threading
+import types
 import warnings
 from logging.handlers import RotatingFileHandler
 
@@ -54,13 +59,14 @@ from PySide6.QtWidgets import (
     QMessageBox, QSlider, QSpinBox, QDoubleSpinBox, QScrollArea, QAbstractItemView, QSplitter,
     QTreeWidget, QTreeWidgetItem, QMenu, QHeaderView
 )
-from PySide6.QtCore import Qt, QTimer, QSize, Signal, QThread, QUrl, QElapsedTimer
+from PySide6.QtCore import Qt, QTimer, QSize, Signal, QThread, QUrl, QElapsedTimer, QPoint
 try:
     from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
     AUDIO_SUPPORTED = True
 except Exception:  # Qt Multimedia missing: preview still works, just silent
     AUDIO_SUPPORTED = False
-from PySide6.QtGui import QPixmap, QImage, QFont, QIcon, QPainter, QColor, QKeySequence, QShortcut
+from PySide6.QtGui import (QPixmap, QImage, QFont, QIcon, QPainter, QColor, QKeySequence, QShortcut,
+                           QAction, QDesktopServices)
 
 
 # =====================================================================
@@ -223,9 +229,12 @@ def even(value):
     return max(2, int(value) // 2 * 2)
 
 
-def cover_filter(w, h):
-    """Scale to fill w x h and center-crop the overflow (works for any source shape)."""
-    return f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1"
+def cover_filter(w, h, x=0.5):
+    """Scale to fill w x h and crop the overflow (works for any source shape).
+    x picks which part stays: 0 = left edge, 0.5 = centre, 1 = right edge."""
+    x = max(0.0, min(1.0, float(x)))
+    return (f"scale={w}:{h}:force_original_aspect_ratio=increase,"
+            f"crop={w}:{h}:(in_w-{w})*{x:.3f}:(in_h-{h})/2,setsar=1")
 
 
 def describe_audio_track(n, stream):
@@ -312,6 +321,8 @@ DEFAULT_STYLE = {
     "shadow_softness": 50,  # 0 = hard edge, 100 = very soft
     "voice_colors": "highlight",  # how voices are coloured: off | highlight | line
     "voice_names": False,         # show "Name:" in front of each caption
+    "timing_offset": 0.0,         # seconds: + shows captions later, - earlier
+    "y_offset": 0,                # nudge captions up (-) or down (+), % of the frame height
 }
 HOLD_GAP = 0.5
 VOICE_PALETTE = [[255, 212, 0], [0, 229, 255], [255, 79, 216], [124, 255, 79],
@@ -410,6 +421,7 @@ class CaptionRenderer:
         """Returns an RGBA caption layer, or None when nothing is on screen."""
         if track is None:
             return None
+        t = t - float(self.style.get("timing_offset", 0.0) or 0.0)
         gi = track.group_index_at(t)
         if gi < 0:
             return None
@@ -488,6 +500,8 @@ class CaptionRenderer:
             top = round(h * 0.08) + pad_y
         else:
             top = round(h * 0.90) - block_h - pad_y
+        top += round(h * int(st.get("y_offset", 0) or 0) / 100)   # fine-tune height
+        top = max(pad_y, min(h - block_h - pad_y, top))           # never off the frame
 
         img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
@@ -558,8 +572,9 @@ def subtitle_timestamp(t, vtt=False):
     return f"{hours:02}:{minutes:02}:{seconds:02}{sep}{ms:03}"
 
 
-def build_subtitles(track, vtt=False, voices=None):
+def build_subtitles(track, vtt=False, voices=None, offset=0.0):
     out = ["WEBVTT", ""] if vtt else []
+    offset = float(offset or 0.0)
     voices = voices or []
     for n, group in enumerate(track.groups, 1):
         text = " ".join(track.words[i]["word"] for i in group["idx"])
@@ -570,7 +585,7 @@ def build_subtitles(track, vtt=False, voices=None):
         end = max(group["end"], group["start"] + 0.2)
         if not vtt:
             out.append(str(n))
-        out.append(f"{subtitle_timestamp(group['start'], vtt)} --> {subtitle_timestamp(end, vtt)}")
+        out.append(f"{subtitle_timestamp(group['start'] + offset, vtt)} --> {subtitle_timestamp(end + offset, vtt)}")
         out.append(text)
         out.append("")
     return "\n".join(out)
@@ -723,11 +738,39 @@ class VoiceDetectWorker(QThread):
             self.failed.emit(str(e) or e.__class__.__name__)
 
 
+class TranscriptionCancelled(Exception):
+    pass
+
+
+class _ProgressBar:
+    """Stands in for Whisper's tqdm progress bars so the app can show progress and cancel."""
+
+    def __init__(self, callback, total=None):
+        self.callback = callback
+        self.total = total or 0
+        self.n = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def update(self, n=1):
+        self.n += n
+        self.callback(self.n, self.total)
+
+    def close(self):
+        pass
+
+
 class TranscriptionWorker(QThread):
     succeeded = Signal(dict, str)
     failed = Signal(str)
     fallback_warning = Signal(str)
     status = Signal(str)
+    progress = Signal(int)
+    cancelled = Signal()
 
     def __init__(self, video_path, accel, model_name, language, audio_track=0):
         super().__init__()
@@ -736,6 +779,36 @@ class TranscriptionWorker(QThread):
         self.accel = accel
         self.model_name = model_name
         self.language = language
+        self._cancel = False
+        self._device = "cpu"
+
+    def cancel(self):
+        self._cancel = True
+
+    def _check_cancel(self):
+        if self._cancel:
+            raise TranscriptionCancelled()
+
+    def _install_progress_hooks(self, whisper):
+        """Route Whisper's download/transcribe progress into the app (and let Cancel stop it)."""
+        import whisper.transcribe as whisper_transcribe
+
+        def on_download(n, total):
+            self._check_cancel()
+            if total:
+                self.status.emit(f"Downloading the '{self.model_name}' model (one time only)... "
+                                 f"{n * 100 // total}%  ({n / 1048576:.0f} of {total / 1048576:.0f} MB)")
+
+        def on_transcribe(n, total):
+            self._check_cancel()
+            if total:
+                pct = min(100, n * 100 // total)
+                self.progress.emit(pct)
+                self.status.emit(f"Transcribing on {'GPU' if self._device == 'cuda' else 'CPU'}... {pct}%")
+
+        whisper.tqdm = lambda *a, **kw: _ProgressBar(on_download, kw.get("total"))
+        whisper_transcribe.tqdm = types.SimpleNamespace(
+            tqdm=lambda *a, **kw: _ProgressBar(on_transcribe, kw.get("total")))
 
     def resolve_device(self):
         if self.accel == "cpu":
@@ -750,6 +823,9 @@ class TranscriptionWorker(QThread):
 
     def transcribe(self, audio, device):
         import whisper
+        self._device = device
+        self._install_progress_hooks(whisper)
+        self._check_cancel()
         key = (self.model_name, device)
         with _MODEL_LOCK:
             model = _MODEL_CACHE.get(key)
@@ -768,17 +844,21 @@ class TranscriptionWorker(QThread):
         try:
             self.status.emit("Reading audio...")
             audio = load_audio_16k(self.video_path, self.audio_track)
+            self._check_cancel()
             device = self.resolve_device()
             try:
                 result = self.transcribe(audio, device)
             except Exception as primary_error:
-                if device != "cuda":
+                if device != "cuda" or isinstance(primary_error, TranscriptionCancelled):
                     raise
                 log.exception("GPU transcription failed, falling back to CPU")
                 self.fallback_warning.emit(str(primary_error))
                 device = "cpu"
                 result = self.transcribe(audio, device)
             self.succeeded.emit(result, device)
+        except TranscriptionCancelled:
+            log.info("Transcription cancelled")
+            self.cancelled.emit()
         except Exception as e:
             log.exception("Transcription failed")
             self.failed.emit(str(e) or e.__class__.__name__)
@@ -797,7 +877,8 @@ class ExportWorker(QThread):
     failed = Signal(str)
     cancelled = Signal()
 
-    def __init__(self, video_path, info, out_file, export_mode, vertical, words, style, font_info, voices=None):
+    def __init__(self, video_path, info, out_file, export_mode, vertical, words, style, font_info, voices=None,
+                 crop_x=0.5):
         super().__init__()
         self.video_path = video_path
         self.info = info
@@ -808,6 +889,7 @@ class ExportWorker(QThread):
         self.style = dict(style)
         self.font_info = font_info
         self.voices = copy.deepcopy(voices or [])
+        self.crop_x = crop_x
         self._cancel = False
         self._procs = []
 
@@ -874,7 +956,7 @@ class ExportWorker(QThread):
         renderer = CaptionRenderer(self.style, self.font_info, self.voices)
         if self.vertical:
             out_w, out_h = 1080, 1920
-            vf = f"fps={fps_str},{cover_filter(out_w, out_h)}"
+            vf = f"fps={fps_str},{cover_filter(out_w, out_h, self.crop_x)}"
         else:
             out_w, out_h = even(info["width"]), even(info["height"])
             vf = f"fps={fps_str},scale={out_w}:{out_h},setsar=1"
@@ -963,7 +1045,7 @@ class DropZone(QFrame):
         self.setObjectName("DropZoneWorkspace")
         self.setMinimumHeight(65)
         layout = QVBoxLayout(self)
-        self.label = QLabel("📥 Drag & Drop Video File Here")
+        self.label = QLabel("📥 Drag & Drop a Video or Project Here")
         self.label.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.label)
         self.set_accent("#00ADB5", "#00FFF5")
@@ -985,12 +1067,12 @@ class DropZone(QFrame):
         files = [u.toLocalFile() for u in event.mimeData().urls()]
         if not files:
             return
-        if files[0].lower().endswith(VIDEO_EXTS):
+        if files[0].lower().endswith(VIDEO_EXTS + PROJECT_EXTS):
             self.callback(files[0])
         else:
-            log.warning(f"DropZone rejected non-video file: {files[0]}")
-            self.label.setText("⚠ That isn't a supported video file")
-            QTimer.singleShot(2500, lambda: self.label.setText("📥 Drag & Drop Video File Here"))
+            log.warning(f"DropZone rejected file: {files[0]}")
+            self.label.setText("⚠ Drop a video or a caption project")
+            QTimer.singleShot(2500, lambda: self.label.setText("📥 Drag & Drop a Video or Project Here"))
 
 
 # =====================================================================
@@ -1021,11 +1103,11 @@ class VideoFrameReader:
             self.process = None
         self.stream_time = -1.0
 
-    def frame_at(self, t, w, h):
+    def frame_at(self, t, w, h, crop_x=0.5):
         t = max(0.0, min(t, max(0.0, self.duration - 1.0 / self.fps)))
         frame_size = w * h * 3
 
-        if self.process and self.size == (w, h) and self.stream_time >= 0:
+        if self.process and self.size == (w, h, crop_x) and self.stream_time >= 0:
             delta = t - self.stream_time
             steps = round(delta * self.fps)
             if steps == 0 and self.last_frame is not None and delta > -0.5 / self.fps:
@@ -1044,9 +1126,9 @@ class VideoFrameReader:
                     pass
 
         self.close_active_stream()
-        self.size = (w, h)
+        self.size = (w, h, crop_x)
         cmd = [FFMPEG_BIN, "-nostdin", "-v", "error", "-ss", f"{t:.3f}", "-i", self.video_path,
-               "-vf", cover_filter(w, h), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+               "-vf", cover_filter(w, h, crop_x), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
         try:
             self.process = popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=frame_size * 4)
             raw = self.process.stdout.read(frame_size)
@@ -1108,14 +1190,74 @@ WHISPER_MODELS = [
 ]
 LANGUAGES = [("", "Auto-detect"), ("en", "English"), ("es", "Spanish"), ("fr", "French"),
              ("de", "German"), ("pt", "Portuguese"), ("it", "Italian"), ("ja", "Japanese")]
-PROJECT_FILTER = "Caption Projects (*.bcs.json);;JSON files (*.json)"
+PROJECT_EXT = ".bcsproj"
+PROJECT_EXTS = (".bcsproj", ".bcs.json")
+PROJECT_FILTER = "Caption Projects (*.bcsproj *.bcs.json);;All files (*.*)"
+AUTOSAVE_FILE = os.path.join(DATA_DIR, "autosave.bcsproj")
+GITHUB_REPO = "boneSk8er5-lab/BonesCaptionStudio"
+OVERLAY_BYTES_PER_PIXEL = 0.09   # measured: ProRes 4444 caption overlays ~0.077 bytes per pixel per frame
+
+
+def version_key(text):
+    """'6.7.0-beta.2' -> (6, 7, 0, 0, 2); a full release sorts after its betas."""
+    m = re.match(r"v?(\d+)\.(\d+)(?:\.(\d+))?(?:[-.]?beta\.?(\d+))?", str(text).strip(), re.I)
+    if not m:
+        return (0, 0, 0, 0, 0)
+    major, minor, patch, beta = (int(x) if x else 0 for x in m.groups())
+    return (major, minor, patch, 0 if m.group(4) else 1, beta)
+
+
+class UpdateCheckWorker(QThread):
+    done = Signal(dict)
+
+    def run(self):
+        import urllib.request
+        try:
+            req = urllib.request.Request(f"https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=20",
+                                         headers={"User-Agent": f"BonesCaptionStudio/{APP_VERSION}",
+                                                  "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                releases = json.loads(r.read().decode("utf-8"))
+            self.done.emit({"ok": True, "releases": releases})
+        except Exception as e:
+            self.done.emit({"ok": False, "error": str(e)})
 
 
 class MainWindow(QMainWindow):
+    @property
+    def dirty(self):
+        return getattr(self, "_dirty", False)
+
+    @dirty.setter
+    def dirty(self, value):
+        self._dirty = bool(value)
+        self.update_title()
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls() and self.busy is None:
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        files = [u.toLocalFile() for u in event.mimeData().urls()]
+        if files and self.busy is None:
+            self.open_any_file(files[0])
+
+    def update_title(self):
+        project = getattr(self, "project_path", None)
+        video = getattr(self, "video_path", None)
+        if project:
+            name = os.path.basename(project)
+        elif video:
+            name = os.path.basename(video) + " (not saved)"
+        else:
+            name = "New Project"
+        mark = "● " if getattr(self, "_dirty", False) else ""
+        self.setWindowTitle(f"{mark}{name} — {APP_NAME} v{APP_VERSION_FULL}" + (" (Portable)" if PORTABLE else ""))
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"{APP_NAME} - v{APP_VERSION_FULL}" + (" (Portable)" if PORTABLE else ""))
-        self.setGeometry(100, 100, 1400, 880)
+        self.setAcceptDrops(True)
+        self.resize(1400, 880)
         icon_path = resource_path("BCS.ico")
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
@@ -1184,6 +1326,7 @@ class MainWindow(QMainWindow):
         self.restore_combo(self.model_combo, ui.get("model", "base"))
         self.restore_combo(self.lang_combo, ui.get("language", ""))
         self.vertical_checkbox.setChecked(bool(ui.get("vertical", False)))
+        self.crop_slider.setValue(int(ui.get("crop", 50)))
         self.volume_slider.setValue(int(ui.get("volume", 80)))
         self.set_muted(bool(ui.get("muted", False)))
         self.apply_export_mode_labels()
@@ -1205,15 +1348,16 @@ class MainWindow(QMainWindow):
         self.hw_probe.done.connect(self.on_hardware_probed)
         self.hw_probe.start()
 
-        QShortcut(QKeySequence("Ctrl+O"), self, activated=self.open_project)
-        QShortcut(QKeySequence("Ctrl+S"), self, activated=self.save_project)
-        QShortcut(QKeySequence("Ctrl+I"), self, activated=self.load_video)
+        self.build_menus()
+        self.restore_window_geometry()
+        self.autosave_timer = QTimer(self)
+        self.autosave_timer.timeout.connect(self.autosave)
+        self.autosave_timer.start(90 * 1000)  # every 90 seconds while there are unsaved edits
+        self.update_title()
+
         QShortcut(QKeySequence(Qt.Key_Space), self, activated=self.toggle_play)
         QShortcut(QKeySequence.Delete, self.caption_list, activated=self.toggle_hidden_selected)
         QShortcut(QKeySequence("Shift+Delete"), self.caption_list, activated=self.delete_selected_words)
-        QShortcut(QKeySequence("Ctrl+Z"), self, activated=self.undo)
-        QShortcut(QKeySequence("Ctrl+Y"), self, activated=self.redo)
-        QShortcut(QKeySequence("Ctrl+F"), self, activated=lambda: self.search_box.setFocus())
         for n in range(10):  # 1-9 = set voice, 0 = no voice
             QShortcut(QKeySequence(str(n)), self.caption_list,
                       activated=lambda n=n: self.assign_voice_selected(None if n == 0 else n - 1))
@@ -1260,6 +1404,9 @@ class MainWindow(QMainWindow):
             QTreeWidget::item {{ padding: 3px 2px; }}
             QTreeWidget::item:selected {{ background-color: {primary}; color: {text_accent}; }}
             QHeaderView::section {{ background-color: #1E1E1E; color: #9A9A9A; border: none; padding: 4px 6px; font-weight: bold; }}
+            QMenuBar {{ background-color: #121212; color: #E0E0E0; padding: 2px 6px; }}
+            QMenuBar::item {{ padding: 5px 10px; border-radius: 4px; background: transparent; }}
+            QMenuBar::item:selected {{ background-color: #2D2D2D; }}
             QMenu {{ background-color: #1E1E1E; border: 1px solid #2D2D2D; padding: 4px; }}
             QMenu::item {{ padding: 6px 22px 6px 22px; }}
             QMenu::item:selected {{ background-color: {primary}; color: {text_accent}; }}
@@ -1380,7 +1527,7 @@ class MainWindow(QMainWindow):
         sidebar.setContentsMargins(0, 0, 6, 0)
         sidebar.setSpacing(10)
 
-        self.drop_zone = DropZone(self.process_dropped_video)
+        self.drop_zone = DropZone(self.open_any_file)
         sidebar.addWidget(self.drop_zone)
 
         # Project
@@ -1575,7 +1722,7 @@ class MainWindow(QMainWindow):
                  "How far the shadow sits from the text (scales with the text size). 0 = right behind it."),
                 ("shadow_softness", "Shadow softness", 0, 100, 10, " %", False,
                  "0% = hard, crisp edge. Higher = softer, more blurred shadow."),
-        ), start=3):
+        ), start=5):
             caption = QLabel(label)
             caption.setToolTip(tip)
             spin = QSpinBox()
@@ -1596,6 +1743,29 @@ class MainWindow(QMainWindow):
         self.size_spin.setSuffix(" %")
         self.size_spin.valueChanged.connect(self.on_size_changed)
         grid.addWidget(self.stepper(self.size_spin), 1, 1)
+        height_label = QLabel("Caption height")
+        height_tip = "Nudge the captions up (-) or down (+), on top of the Bottom / Center / Top setting."
+        height_label.setToolTip(height_tip)
+        self.y_offset_spin = QSpinBox()
+        self.y_offset_spin.setRange(-40, 40)
+        self.y_offset_spin.setSuffix(" %")
+        self.y_offset_spin.setToolTip(height_tip)
+        self.y_offset_spin.valueChanged.connect(lambda v: self.on_style_number("y_offset", v))
+        grid.addWidget(height_label, 3, 0)
+        grid.addWidget(self.stepper(self.y_offset_spin), 3, 1)
+        timing_label = QLabel("Timing offset")
+        timing_tip = ("Shift every caption earlier (-) or later (+) if they feel out of sync with the voice. "
+                      "Also applies to exports and SRT/VTT.")
+        timing_label.setToolTip(timing_tip)
+        self.timing_spin = QDoubleSpinBox()
+        self.timing_spin.setRange(-5.0, 5.0)
+        self.timing_spin.setSingleStep(0.05)
+        self.timing_spin.setDecimals(2)
+        self.timing_spin.setSuffix(" s")
+        self.timing_spin.setToolTip(timing_tip)
+        self.timing_spin.valueChanged.connect(lambda v: self.on_style_number("timing_offset", round(v, 2)))
+        grid.addWidget(timing_label, 4, 0)
+        grid.addWidget(self.stepper(self.timing_spin), 4, 1)
         lay.addLayout(grid)
         sidebar.addWidget(panel)
 
@@ -1612,12 +1782,25 @@ class MainWindow(QMainWindow):
         self.export_btn.clicked.connect(self.export)
         self.cancel_btn = QPushButton("Cancel Export")
         self.cancel_btn.setObjectName("CancelBtn")
-        self.cancel_btn.clicked.connect(self.cancel_export)
+        self.cancel_btn.clicked.connect(self.cancel_current)
         self.cancel_btn.hide()
         self.subs_btn = QPushButton("Export Subtitles (.srt / .vtt)")
         self.subs_btn.clicked.connect(self.export_subtitles)
         lay.addWidget(self.export_mode_btn)
         lay.addWidget(self.vertical_checkbox)
+        crop_row = QHBoxLayout()
+        self.crop_label = QLabel("Crop: Left")
+        self.crop_slider = QSlider(Qt.Horizontal)
+        self.crop_slider.setRange(0, 100)
+        self.crop_slider.setValue(50)
+        self.crop_slider.setToolTip("Which part of a wide video stays in the 9:16 frame - keep your facecam or the action in view")
+        self.crop_slider.valueChanged.connect(self.on_crop_changed)
+        crop_row.addWidget(self.crop_label)
+        crop_row.addWidget(self.crop_slider, 1)
+        crop_right = QLabel("Right")
+        crop_row.addWidget(crop_right)
+        self.crop_widgets = (self.crop_label, self.crop_slider, crop_right)
+        lay.addLayout(crop_row)
         lay.addWidget(self.progress_bar)
         lay.addWidget(self.export_btn)
         lay.addWidget(self.cancel_btn)
@@ -1770,6 +1953,7 @@ class MainWindow(QMainWindow):
             self.font_search, self.preset_combo, self.preset_save_btn, self.preset_del_btn,
             self.text_btn, self.hl_btn, self.outline_color_btn, self.bg_btn, self.outline_btn, self.shadow_btn,
             self.pos_btn, self.mode_btn, self.size_spin.stepper_box, self.export_mode_btn, self.caption_list,
+            self.y_offset_spin.stepper_box, self.timing_spin.stepper_box,
             self.hide_btn, self.voice_btn, self.voice_count_combo, self.auto_detect_cb, self.voices_container,
             self.add_voice_btn, self.voice_colors_btn, self.voice_names_btn,
         ]
@@ -1800,7 +1984,13 @@ class MainWindow(QMainWindow):
             caption.setEnabled(shadow_on)
         self.track_combo.setEnabled(idle)
         self.pause_label.setEnabled(idle and self.style["mode"] == "auto")
-        self.cancel_btn.setVisible(self.busy == "export")
+        vertical_on = idle and self.export_mode == "merge" and self.vertical_checkbox.isChecked()
+        for widget in self.crop_widgets:
+            widget.setEnabled(vertical_on)
+        self.cancel_btn.setVisible(self.busy in ("export", "transcribe"))
+        self.cancel_btn.setText("Cancel Transcription" if self.busy == "transcribe" else "Cancel Export")
+        if hasattr(self, "menu_actions"):
+            self.update_menu_state()
         self.drop_zone.setAcceptDrops(idle)
 
     def set_busy(self, reason):
@@ -1822,6 +2012,8 @@ class MainWindow(QMainWindow):
         ui["language"] = self.lang_combo.currentData()
         ui["export_mode"] = self.export_mode
         ui["vertical"] = self.vertical_checkbox.isChecked()
+        if hasattr(self, "crop_slider"):
+            ui["crop"] = self.crop_slider.value()
         if hasattr(self, "splitter") and self.splitter.sizes()[0] > 0:
             ui["sidebar_width"] = self.splitter.sizes()[0]
         if hasattr(self, "center_splitter") and min(self.center_splitter.sizes()) > 0:
@@ -1844,7 +2036,9 @@ class MainWindow(QMainWindow):
         self.mode_btn.setText({"sentence": "Mode: Sentence", "auto": "Mode: Auto (pauses)",
                                "word": "Mode: Word"}.get(st["mode"], "Mode: Sentence"))
         for spin, value in ((self.max_words_spin, int(st["max_words"])), (self.size_spin, int(st["size"])),
-                            (self.pause_spin, float(st.get("pause_split", 0.5)))) + tuple(
+                            (self.pause_spin, float(st.get("pause_split", 0.5))),
+                            (self.y_offset_spin, int(st.get("y_offset", 0) or 0)),
+                            (self.timing_spin, float(st.get("timing_offset", 0.0) or 0.0))) + tuple(
                 (spin, int(st.get(key, DEFAULT_STYLE[key]))) for key, _c, spin in self.shadow_controls):
             spin.blockSignals(True)
             spin.setValue(value)
@@ -2079,8 +2273,9 @@ class MainWindow(QMainWindow):
             self.rebuild_voice_panel()
             self.rebuild_track()
             self.rebuild_caption_list()
-            self.dirty = False
             self.project_path = None
+            self.dirty = False
+            self.clear_autosave()
             self.progress_bar.setValue(0)
             self.update_controls()
             self.refresh_preview()
@@ -2144,6 +2339,8 @@ class MainWindow(QMainWindow):
         self.transcription_worker.failed.connect(self.on_transcription_failure)
         self.transcription_worker.fallback_warning.connect(self.show_fallback_dialog)
         self.transcription_worker.status.connect(self.label.setText)
+        self.transcription_worker.progress.connect(self.on_transcription_progress)
+        self.transcription_worker.cancelled.connect(self.on_transcription_cancelled)
         self.transcription_worker.start()
 
     def show_fallback_dialog(self, error_msg):
@@ -2186,6 +2383,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, lambda: self.detect_voices(ask=False))
 
     def on_transcription_failure(self, error_message):
+        self.cancel_btn.setEnabled(True)
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.set_busy(None)
@@ -2850,6 +3048,15 @@ class MainWindow(QMainWindow):
             return t
         return self._play_base + self._play_clock.elapsed() / 1000.0
 
+    def crop_x(self):
+        return self.crop_slider.value() / 100.0
+
+    def on_crop_changed(self, value):
+        self.crop_slider.setToolTip(f"Crop position: {value}% (50 = centre)")
+        self.save_ui_settings()
+        if self.video_path and not self.preview_running:
+            self.seek_timer.start(60)
+
     def handle_checkbox_toggle(self, *_):
         self.save_ui_settings()
         if not self.preview_running:
@@ -2857,7 +3064,8 @@ class MainWindow(QMainWindow):
 
     def refresh_preview(self):
         w, h = self.preview_size()
-        frame = self.frame_reader.frame_at(self.preview_time, w, h) if self.frame_reader else None
+        crop = self.crop_x() if (self.vertical_checkbox.isChecked() and self.export_mode == "merge") else 0.5
+        frame = self.frame_reader.frame_at(self.preview_time, w, h, crop) if self.frame_reader else None
         base = frame.convert("RGBA") if frame is not None else Image.new("RGBA", (w, h), (10, 10, 10, 255))
         layer = self.get_renderer().overlay(self.preview_time, w, h, self.track)
         if layer is not None:
@@ -2939,6 +3147,8 @@ class MainWindow(QMainWindow):
         if os.path.abspath(out_file) == os.path.abspath(self.video_path):
             QMessageBox.warning(self, "Pick another name", "You can't export over the original video.")
             return
+        if not self.check_export_space(out_file, vertical):
+            return
 
         log.debug(f"Export starting: mode={self.export_mode} vertical={vertical} -> {out_file}")
         self.progress_bar.setValue(0)
@@ -2946,12 +3156,65 @@ class MainWindow(QMainWindow):
         self.set_busy("export")
         self.export_worker = ExportWorker(
             self.video_path, self.video_info, out_file, self.export_mode, vertical,
-            self.words, self.style, self.font_map.get(self.style.get("font")), self.voices)
+            self.words, self.style, self.font_map.get(self.style.get("font")), self.voices, self.crop_x())
         self.export_worker.progress.connect(self.on_export_progress)
         self.export_worker.succeeded.connect(self.on_export_success)
         self.export_worker.failed.connect(self.on_export_failure)
         self.export_worker.cancelled.connect(self.on_export_cancelled)
         self.export_worker.start()
+
+    def estimate_export_size(self, vertical):
+        info = self.video_info or {}
+        duration, fps = info.get("duration", 0) or 0, info.get("fps", 30) or 30
+        if self.export_mode == "overlay":
+            w, h = even(info.get("width", 1920)), even(info.get("height", 1080))
+            return int(OVERLAY_BYTES_PER_PIXEL * w * h * fps * duration)
+        try:
+            source = os.path.getsize(self.video_path)
+        except OSError:
+            source = 0
+        return int(max(source * 1.5, duration * 2.5e6))  # re-encode at high quality ~ up to 20 Mbps
+
+    def check_export_space(self, out_file, vertical):
+        estimate = self.estimate_export_size(vertical)
+        try:
+            free = shutil.disk_usage(os.path.dirname(os.path.abspath(out_file))).free
+        except OSError:
+            free = None
+        gb = lambda n: f"{n / 1e9:.1f} GB"
+        if free is not None and estimate > free * 0.95:
+            return QMessageBox.warning(
+                self, "Not enough disk space",
+                f"This export needs about {gb(estimate)}, but that drive only has {gb(free)} free.\n\n"
+                "Free up space or pick another drive. Export anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
+        if self.export_mode == "overlay" and estimate > 5e9:
+            return QMessageBox.question(
+                self, "Large overlay file",
+                f"A transparent caption overlay for this video will be about {gb(estimate)}.\n\n"
+                "For long videos, Export Subtitles (.srt) or Complete Video (.mp4) make far smaller files. "
+                "Continue with the overlay?") == QMessageBox.Yes
+        return True
+
+    def cancel_current(self):
+        if self.busy == "export":
+            self.cancel_export()
+        elif self.busy == "transcribe" and self.transcription_worker and self.transcription_worker.isRunning():
+            self.label.setText("Cancelling... (stops after the current few seconds of audio)")
+            self.cancel_btn.setEnabled(False)
+            self.transcription_worker.cancel()
+
+    def on_transcription_progress(self, pct):
+        if self.progress_bar.maximum() == 0:
+            self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(pct)
+
+    def on_transcription_cancelled(self):
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.cancel_btn.setEnabled(True)
+        self.set_busy(None)
+        self.label.setText("Transcription cancelled")
 
     def cancel_export(self):
         if self.export_worker and self.export_worker.isRunning():
@@ -3026,46 +3289,72 @@ class MainWindow(QMainWindow):
             out_file += ".srt"
         try:
             with open(out_file, "w", encoding="utf-8") as f:
-                f.write(build_subtitles(self.track, vtt=vtt, voices=self.voices))
+                f.write(build_subtitles(self.track, vtt=vtt, voices=self.voices,
+                                        offset=self.style.get("timing_offset", 0.0)))
             self.label.setText(f"Subtitles saved: {os.path.basename(out_file)}")
         except Exception as e:
             QMessageBox.critical(self, "Couldn't save subtitles", str(e))
 
     # ------------------------------------------------------------------ projects
-    def save_project(self):
-        if self.busy or (not self.video_path and not self.words):
-            return False
-        path = self.project_path
-        if not path:
-            default = (os.path.splitext(self.video_path)[0] if self.video_path else "captions") + ".bcs.json"
-            path, _ = QFileDialog.getSaveFileName(self, "Save Caption Project", default, PROJECT_FILTER)
-            if not path:
-                return False
-            if not path.lower().endswith(".json"):
-                path += ".bcs.json"
-        data = {
+    def project_data(self):
+        return {
             "app": APP_NAME, "version": APP_VERSION,
             "video_path": self.video_path, "words": self.words, "style": self.style, "voices": self.voices,
             "export_mode": self.export_mode, "vertical": self.vertical_checkbox.isChecked(),
-            "audio_track": self.selected_track(),
+            "audio_track": self.selected_track(), "crop": self.crop_slider.value(),
         }
+
+    @staticmethod
+    def write_json_atomic(path, data):
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=1)
+        os.replace(tmp, path)
+
+    def save_project(self, save_as=False):
+        if self.busy or (not self.video_path and not self.words):
+            return False
+        path = None if save_as else self.project_path
+        if not path:
+            base = os.path.splitext(self.project_path or self.video_path or "captions")[0]
+            if base.lower().endswith(".bcs"):
+                base = base[:-4]
+            path, _ = QFileDialog.getSaveFileName(self, "Save Caption Project", base + PROJECT_EXT, PROJECT_FILTER)
+            if not path:
+                return False
+            if not path.lower().endswith(PROJECT_EXTS):
+                path += PROJECT_EXT
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=1)
+            self.write_json_atomic(path, self.project_data())
         except Exception as e:
             QMessageBox.critical(self, "Couldn't save project", str(e))
             return False
         self.project_path = path
         self.dirty = False
+        self.add_recent(path)
+        self.clear_autosave()
         self.label.setText(f"Project saved: {os.path.basename(path)}")
         return True
+
+    def save_project_as(self):
+        return self.save_project(save_as=True)
 
     def open_project(self):
         if self.busy or not self.confirm_discard():
             return
         path, _ = QFileDialog.getOpenFileName(self, "Open Caption Project", "", PROJECT_FILTER)
-        if not path:
-            return
+        if path:
+            self.open_project_path(path, confirmed=True)
+
+    def open_project_path(self, path, confirmed=False, from_autosave=False):
+        if self.busy:
+            return False
+        if not confirmed and not self.confirm_discard():
+            return False
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "Project not found", f"This project file no longer exists:\n{path}")
+            self.remove_recent(path)
+            return False
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -3085,7 +3374,7 @@ class MainWindow(QMainWindow):
                       for n, v in enumerate(data.get("voices", []) or [])]
         except Exception as e:
             QMessageBox.critical(self, "Couldn't open project", f"That file isn't a valid caption project.\n\n{e}")
-            return
+            return False
 
         video = data.get("video_path")
         if not video or not os.path.exists(video):
@@ -3093,9 +3382,9 @@ class MainWindow(QMainWindow):
                                     f"The project's video wasn't found:\n{video}\n\nPlease locate it.")
             video, _ = QFileDialog.getOpenFileName(self, "Locate Video", "", "Videos (*.mp4 *.mov *.avi *.mkv *.webm *.m4v)")
             if not video:
-                return
+                return False
         if not self.open_video(video):
-            return
+            return False
 
         self.style.update({k: v for k, v in data.get("style", {}).items() if k in DEFAULT_STYLE})
         self.export_mode = data.get("export_mode", self.export_mode)
@@ -3114,12 +3403,401 @@ class MainWindow(QMainWindow):
         self.rebuild_caption_list()
         self.refresh_fonts(keep_style_font=True)
         self.sync_style_widgets()
-        self.project_path = path
-        self.dirty = False
+        if from_autosave:
+            self.project_path = data.get("autosave_of") or None
+        else:
+            self.project_path = path
+            self.add_recent(path)
+        if "crop" in data:
+            self.crop_slider.setValue(int(data.get("crop", 50)))
+        self.dirty = from_autosave
+        self.update_title()
         self.update_slider_range()
         self.update_controls()
         self.on_style_changed()
-        self.label.setText(f"Opened project: {os.path.basename(path)}")
+        self.label.setText("Restored your unsaved work" if from_autosave else f"Opened project: {os.path.basename(path)}")
+        return True
+
+
+    def open_any_file(self, path):
+        """Videos start a new project; .bcsproj files open the project."""
+        if path.lower().endswith(PROJECT_EXTS):
+            self.open_project_path(path)
+        elif path.lower().endswith(VIDEO_EXTS):
+            self.process_dropped_video(path)
+
+    def new_project(self):
+        if self.busy or not self.confirm_discard():
+            return
+        self.pause_preview()
+        if self.frame_reader:
+            self.frame_reader.close_active_stream()
+        if self.audio_player is not None:
+            self.audio_player.stop()
+            self.audio_player.setSource(QUrl())
+        self.frame_reader = None
+        self.video_path = None
+        self.video_info = None
+        self.words, self.voices = [], []
+        self.reset_history()
+        self.project_path = None
+        self.populate_tracks([])
+        self.rebuild_voice_panel()
+        self.rebuild_track()
+        self.rebuild_caption_list()
+        self.preview_time = 0.0
+        self.update_slider_range()
+        self.progress_bar.setValue(0)
+        self.clear_autosave()
+        self.dirty = False
+        self.update_controls()
+        self.refresh_preview()
+        self.label.setText("Ready")
+
+    # ------------------------------------------------------------------ recent projects
+    def add_recent(self, path):
+        path = os.path.abspath(path)
+        recent = [p for p in self.settings.get("recent", []) if os.path.normcase(p) != os.path.normcase(path)]
+        self.settings["recent"] = [path] + recent[:9]
+        save_settings(self.settings)
+
+    def remove_recent(self, path):
+        self.settings["recent"] = [p for p in self.settings.get("recent", [])
+                                   if os.path.normcase(p) != os.path.normcase(os.path.abspath(path))]
+        save_settings(self.settings)
+
+    def fill_recent_menu(self):
+        menu = self.recent_menu
+        menu.clear()
+        recent = self.settings.get("recent", [])
+        if not recent:
+            menu.addAction("(No recent projects)").setEnabled(False)
+            return
+        for n, path in enumerate(recent, 1):
+            exists = os.path.exists(path)
+            act = menu.addAction(f"&{n % 10}  {os.path.basename(path)}" + ("" if exists else "  (missing)"))
+            act.setToolTip(path)
+            act.setStatusTip(path)
+            act.setEnabled(exists and not self.busy)
+            act.triggered.connect(lambda _=False, p=path: self.open_project_path(p))
+        menu.addSeparator()
+        menu.addAction("Clear Recent Projects").triggered.connect(self.clear_recent)
+
+    def clear_recent(self):
+        self.settings["recent"] = []
+        save_settings(self.settings)
+
+    # ------------------------------------------------------------------ autosave / recovery
+    def autosave(self):
+        if self.busy or not self.dirty or not (self.words or self.video_path):
+            return
+        try:
+            data = self.project_data()
+            data["autosave_of"] = self.project_path
+            data["autosaved_at"] = time.strftime("%Y-%m-%d %H:%M")
+            self.write_json_atomic(AUTOSAVE_FILE, data)
+            log.debug("Autosaved")
+        except Exception as e:
+            log.warning(f"Autosave failed: {e}")
+
+    def clear_autosave(self):
+        try:
+            if os.path.exists(AUTOSAVE_FILE):
+                os.remove(AUTOSAVE_FILE)
+        except OSError as e:
+            log.warning(f"Couldn't remove autosave: {e}")
+
+    def offer_recovery(self):
+        if not os.path.exists(AUTOSAVE_FILE):
+            return
+        try:
+            with open(AUTOSAVE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            self.clear_autosave()
+            return
+        name = os.path.basename(data.get("autosave_of") or data.get("video_path") or "your project")
+        answer = QMessageBox.question(
+            self, "Restore unsaved work?",
+            f"Bones Caption Studio didn't close normally last time.\n\n"
+            f"Restore your unsaved work on \"{name}\" (autosaved {data.get('autosaved_at', 'recently')})?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if answer == QMessageBox.Yes and self.open_project_path(AUTOSAVE_FILE, confirmed=True, from_autosave=True):
+            return
+        self.clear_autosave()
+
+    # ------------------------------------------------------------------ startup
+    def startup_checks(self, args):
+        self.check_ffmpeg()
+        self.offer_recovery()
+        for arg in args:
+            if os.path.isfile(arg):
+                self.open_any_file(os.path.abspath(arg))
+                break
+
+    def check_ffmpeg(self):
+        missing = []
+        for name, path in (("ffmpeg", FFMPEG_BIN), ("ffprobe", FFPROBE_BIN)):
+            try:
+                if run_cmd([path, "-version"]).returncode != 0:
+                    missing.append(name)
+            except Exception:
+                missing.append(name)
+        if missing:
+            log.error(f"Missing: {missing}")
+            QMessageBox.warning(
+                self, "FFmpeg not found",
+                f"Bones Caption Studio needs {' and '.join(m + '.exe' for m in missing)} to read and export videos, "
+                f"but couldn't find {'it' if len(missing) == 1 else 'them'}.\n\n"
+                f"Put ffmpeg.exe and ffprobe.exe in:\n{app_dir()}\n\nthen restart the app.")
+
+    # ------------------------------------------------------------------ menu bar
+    def build_menus(self):
+        bar = self.menuBar()
+        acts = {}
+
+        def add(menu, key, text, slot, shortcut=None, tip=None):
+            act = QAction(text, self)
+            if shortcut:
+                act.setShortcut(QKeySequence(shortcut))
+            if tip:
+                act.setStatusTip(tip)
+                act.setToolTip(tip)
+            act.triggered.connect(lambda _=False: slot())
+            menu.addAction(act)
+            acts[key] = act
+            return act
+
+        m = bar.addMenu("&File")
+        add(m, "new", "&New Project", self.new_project, "Ctrl+N")
+        add(m, "open", "&Open Project...", self.open_project, "Ctrl+O")
+        self.recent_menu = m.addMenu("Open &Recent")
+        self.recent_menu.aboutToShow.connect(self.fill_recent_menu)
+        m.addSeparator()
+        add(m, "save", "&Save Project", self.save_project, "Ctrl+S")
+        add(m, "save_as", "Save Project &As...", self.save_project_as, "Ctrl+Shift+S")
+        m.addSeparator()
+        add(m, "import", "&Import Video...", self.load_video, "Ctrl+I")
+        ex = m.addMenu("&Export")
+        add(ex, "exp_overlay", "Caption &Overlay (.mov, transparent)...", lambda: self.export_as("overlay", False))
+        add(ex, "exp_full", "Complete &Video (.mp4)...", lambda: self.export_as("merge", False), "Ctrl+E")
+        add(ex, "exp_vertical", "&Vertical Video 9:16 (.mp4)...", lambda: self.export_as("merge", True))
+        ex.addSeparator()
+        add(ex, "exp_subs", "&Subtitles (.srt / .vtt)...", self.export_subtitles)
+        m.addSeparator()
+        add(m, "exit", "E&xit", self.close, "Ctrl+Q")
+
+        m = bar.addMenu("&Edit")
+        add(m, "undo", "&Undo", self.undo, "Ctrl+Z")
+        add(m, "redo", "&Redo", self.redo, "Ctrl+Y")
+        m.addSeparator()
+        add(m, "find", "&Find in Transcript", lambda: self.search_box.setFocus(), "Ctrl+F")
+        add(m, "hide", "&Hide / Show Selected\tDel", self.toggle_hidden_selected)
+        add(m, "delete", "&Delete Selected Permanently\tShift+Del", self.delete_selected_words)
+        self.voice_submenu = m.addMenu("Set &Voice")
+        self.voice_submenu.aboutToShow.connect(self.fill_voice_submenu)
+        m.addSeparator()
+        add(m, "transcribe", "&Generate Captions", self.generate, "F5")
+        add(m, "detect", "Detect &Voices", lambda: self.detect_voices(), "F6")
+
+        m = bar.addMenu("&Help")
+        add(m, "shortcuts", "&Keyboard Shortcuts", self.show_shortcuts, "F1")
+        add(m, "logs", "Open &Logs && Settings Folder", lambda: self.open_folder(DATA_DIR, is_dir=True))
+        m.addSeparator()
+        assoc = add(m, "assoc", "Open .bcsproj Files with Bones Caption Studio", self.toggle_file_association,
+                    tip="Double-clicking a caption project in File Explorer opens it here")
+        assoc.setCheckable(True)
+        m.aboutToShow.connect(lambda: acts["assoc"].setChecked(self.file_association_registered()))
+        m.addSeparator()
+        add(m, "updates", "Check for &Updates...", self.check_for_updates)
+        add(m, "reset", "&Reset Settings...", self.reset_settings)
+        m.addSeparator()
+        add(m, "about", f"&About {APP_NAME}", self.show_about)
+        self.menu_actions = acts
+        self.update_menu_state()
+
+    def fill_voice_submenu(self):
+        self.voice_submenu.clear()
+        for act in self.voice_menu().actions():
+            self.voice_submenu.addAction(act)
+
+    def update_menu_state(self):
+        a = self.menu_actions
+        idle = self.busy is None
+        has_video, has_words = self.video_path is not None, bool(self.words)
+        for key in ("new", "open", "import", "hide", "delete", "assoc", "reset"):
+            a[key].setEnabled(idle)
+        a["save"].setEnabled(idle and (has_video or has_words))
+        a["save_as"].setEnabled(idle and (has_video or has_words))
+        for key in ("exp_overlay", "exp_full", "exp_vertical"):
+            a[key].setEnabled(idle and has_video and has_words)
+        a["exp_subs"].setEnabled(idle and has_words)
+        a["undo"].setEnabled(idle and bool(self._undo))
+        a["redo"].setEnabled(idle and bool(self._redo))
+        a["transcribe"].setEnabled(idle and has_video)
+        a["detect"].setEnabled(idle and has_video and has_words)
+        self.voice_submenu.setEnabled(idle and has_words)
+
+    def export_as(self, mode, vertical):
+        if self.busy:
+            return
+        if self.export_mode != mode:
+            self.toggle_export_mode()
+        if mode == "merge":
+            self.vertical_checkbox.setChecked(vertical)
+        self.export()
+
+    # ------------------------------------------------------------------ help menu
+    def show_shortcuts(self):
+        rows = [("Ctrl+N / Ctrl+O / Ctrl+S", "New / Open / Save project"), ("Ctrl+Shift+S", "Save project as"),
+                ("Ctrl+I", "Import video"), ("Ctrl+E", "Export complete video"), ("F5", "Generate captions"),
+                ("F6", "Detect voices"), ("Space", "Play / pause the preview"), ("Ctrl+Z / Ctrl+Y", "Undo / redo"),
+                ("Ctrl+F", "Search the transcript"), ("Delete", "Hide / show selected lines or words"),
+                ("Shift+Delete", "Delete selected words permanently"), ("1 - 9", "Give selected lines that voice"),
+                ("0", "Remove the voice from selected lines"), ("Double-click", "Edit a line or word"),
+                ("Right-click", "More transcript options"), ("F1", "This list")]
+        html = "<table cellspacing='6'>" + "".join(
+            f"<tr><td><b>{k}</b></td><td>{v}</td></tr>" for k, v in rows) + "</table>"
+        box = QMessageBox(self)
+        box.setWindowTitle("Keyboard Shortcuts")
+        box.setTextFormat(Qt.RichText)
+        box.setText(html)
+        box.exec()
+
+    def show_about(self):
+        edition = "GPU (NVIDIA)" if "GPU" in APP_VERSION_FULL else ("CPU" if "CPU" in APP_VERSION_FULL else "from source")
+        box = QMessageBox(self)
+        box.setWindowTitle(f"About {APP_NAME}")
+        box.setIconPixmap(self.windowIcon().pixmap(64, 64))
+        box.setTextFormat(Qt.RichText)
+        box.setText(
+            f"<h3>{APP_NAME}</h3>"
+            f"<p>Version <b>{APP_VERSION_FULL}</b><br>Edition: {edition}{' · Portable' if PORTABLE else ''}</p>"
+            f"<p>Made by Bones_84.</p>"
+            f"<p><a href='https://github.com/{GITHUB_REPO}'>github.com/{GITHUB_REPO}</a></p>"
+            "<p style='color:#9A9A9A'>Built with OpenAI Whisper, PyTorch, Qt for Python, FFmpeg and the "
+            "Resemblyzer voice model. See THIRD_PARTY_NOTICES.txt for their licences.</p>")
+        notices = os.path.join(app_dir(), "THIRD_PARTY_NOTICES.txt")
+        licences = box.addButton("Third-Party Licences", QMessageBox.ActionRole) if os.path.exists(notices) else None
+        box.addButton(QMessageBox.Ok)
+        box.exec()
+        if licences is not None and box.clickedButton() == licences:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(notices))
+
+    def check_for_updates(self):
+        if getattr(self, "update_worker", None) and self.update_worker.isRunning():
+            return
+        self.label.setText("Checking for updates...")
+        self.update_worker = UpdateCheckWorker()
+        self.update_worker.done.connect(self.on_update_result)
+        self.update_worker.start()
+
+    def on_update_result(self, result):
+        self.label.setText("Ready" if self.busy is None else self.label.text())
+        if not result.get("ok"):
+            QMessageBox.warning(self, "Couldn't check for updates",
+                                f"Couldn't reach GitHub. Check your internet connection.\n\n{result.get('error', '')}")
+            return
+        current = version_key(APP_VERSION_FULL)
+        on_beta = "beta" in APP_VERSION_FULL.lower()
+        candidates = [r for r in result.get("releases", []) if not r.get("draft") and (on_beta or not r.get("prerelease"))]
+        newest = max(candidates, key=lambda r: version_key(r.get("tag_name", "")), default=None)
+        if newest is None or version_key(newest.get("tag_name", "")) <= current:
+            QMessageBox.information(self, "No updates", f"You have the latest version (v{APP_VERSION_FULL}).")
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("Update available")
+        box.setText(f"A newer version is available: <b>{newest.get('name') or newest.get('tag_name')}</b><br>"
+                    f"You have v{APP_VERSION_FULL}.")
+        box.setTextFormat(Qt.RichText)
+        get = box.addButton("Open Download Page", QMessageBox.AcceptRole)
+        box.addButton("Later", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() == get:
+            QDesktopServices.openUrl(QUrl(newest.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases"))
+
+    def reset_settings(self):
+        if self.busy:
+            return
+        if QMessageBox.question(
+                self, "Reset settings?",
+                "Reset the caption style and app settings back to their defaults?\n\n"
+                "Your projects, style presets, favourite fonts, voice names and recent projects are kept.") != QMessageBox.Yes:
+            return
+        font = self.style.get("font")
+        self.style = dict(DEFAULT_STYLE)
+        self.style["font"] = font
+        keep = {k: v for k, v in self.settings.get("ui", {}).items() if k in ("geometry", "window")}
+        self.settings["ui"] = keep
+        self._loading = True
+        self.restore_combo(self.accel_combo, "auto")
+        self.restore_combo(self.model_combo, "base")
+        self.restore_combo(self.lang_combo, "")
+        if self.export_mode != "overlay":
+            self.toggle_export_mode()
+        self.vertical_checkbox.setChecked(False)
+        self.crop_slider.setValue(50)
+        self.volume_slider.setValue(80)
+        self.set_muted(False)
+        self.cb_toggle.setChecked(False)
+        self._loading = False
+        self.sync_style_widgets()
+        self.rebuild_track()
+        self.rebuild_caption_list()
+        self.on_style_changed(rebuild_track=True)
+        self.save_ui_settings()
+        self.label.setText("Settings reset to defaults")
+
+    # ------------------------------------------------------------------ Windows file association (.bcsproj)
+    ASSOC_PROGID = "BonesCaptionStudio.Project"
+
+    @staticmethod
+    def _assoc_command():
+        return f'"{sys.executable}" "%1"'
+
+    def file_association_registered(self):
+        if sys.platform != "win32":
+            return False
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                rf"Software\Classes\{self.ASSOC_PROGID}\shell\open\command") as k:
+                return winreg.QueryValue(k, None) == self._assoc_command()
+        except OSError:
+            return False
+
+    def toggle_file_association(self):
+        if sys.platform != "win32" or not getattr(sys, "frozen", False):
+            QMessageBox.information(self, "File association",
+                                    "This works in the built app (BonesCaptionStudio.exe) on Windows.")
+            return
+        import winreg
+        import ctypes
+        classes = r"Software\Classes"
+        try:
+            if self.file_association_registered():
+                for key in (rf"{self.ASSOC_PROGID}\shell\open\command", rf"{self.ASSOC_PROGID}\shell\open",
+                            rf"{self.ASSOC_PROGID}\shell", rf"{self.ASSOC_PROGID}\DefaultIcon", self.ASSOC_PROGID,
+                            PROJECT_EXT):
+                    try:
+                        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, rf"{classes}\{key}")
+                    except OSError:
+                        pass
+                message = "Caption projects will no longer open with Bones Caption Studio by double-clicking."
+            else:
+                def setv(path, value):
+                    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, rf"{classes}\{path}") as k:
+                        winreg.SetValue(k, None, winreg.REG_SZ, value)
+                setv(PROJECT_EXT, self.ASSOC_PROGID)
+                setv(self.ASSOC_PROGID, "Bones Caption Studio Project")
+                setv(rf"{self.ASSOC_PROGID}\DefaultIcon", f'"{sys.executable}",0')
+                setv(rf"{self.ASSOC_PROGID}\shell\open\command", self._assoc_command())
+                message = ("Done! Double-clicking a .bcsproj caption project in File Explorer now opens it here.\n\n"
+                           "If you move this app's folder, turn this on again.")
+            ctypes.windll.shell32.SHChangeNotify(0x08000000, 0, None, None)  # tell Explorer
+            QMessageBox.information(self, "File association", message)
+        except Exception as e:
+            QMessageBox.warning(self, "File association", f"Couldn't change the file association:\n{e}")
 
     # ------------------------------------------------------------------ shutdown
     def closeEvent(self, event):
@@ -3130,19 +3808,60 @@ class MainWindow(QMainWindow):
             self.export_worker.cancel()
             self.export_worker.wait(10000)
         elif self.busy in ("transcribe", "voices"):
-            if QMessageBox.question(self, "Transcription running", "Captions are still being generated. Quit anyway?") != QMessageBox.Yes:
+            if QMessageBox.question(self, "Still working", "Captions are still being generated. Quit anyway?") != QMessageBox.Yes:
                 event.ignore()
                 return
+            if self.busy == "transcribe" and self.transcription_worker:
+                self.transcription_worker.cancel()
+                self.transcription_worker.wait(8000)
             self.shutdown_cleanup()
-            os._exit(0)  # Whisper can't be interrupted safely; exit hard
+            if (self.transcription_worker and self.transcription_worker.isRunning()) or \
+                    (self.voice_worker and self.voice_worker.isRunning()):
+                os._exit(0)  # still busy (e.g. loading a model) - exit hard
         elif not self.confirm_discard():
             event.ignore()
             return
+        self.clear_autosave()  # the user chose to save or discard
         self.shutdown_cleanup()
         event.accept()
 
+    def save_window_geometry(self):
+        """Remember the window's normal (un-maximised) size and position."""
+        try:
+            g = self.normalGeometry() if self.isMaximized() else self.geometry()
+            if g.width() > 100 and g.height() > 100:
+                self.settings["ui"]["window"] = {
+                    "x": g.x(), "y": g.y(), "w": g.width(), "h": g.height(),
+                    "maximized": bool(self.isMaximized()),
+                }
+        except Exception:
+            pass
+
+    def restore_window_geometry(self):
+        """Put the window back where it was, but never off-screen (e.g. a monitor was unplugged)."""
+        info = self.settings["ui"].get("window")
+        if not isinstance(info, dict):
+            return
+        try:
+            x, y, w, h = (int(info[k]) for k in ("x", "y", "w", "h"))
+        except Exception:
+            return
+        screen = QApplication.screenAt(QPoint(x + w // 2, y + h // 2)) or QApplication.primaryScreen()
+        if screen is None:
+            return
+        avail = screen.availableGeometry()
+        w = max(self.minimumSizeHint().width(), min(w, avail.width()))
+        h = max(self.minimumSizeHint().height(), min(h, avail.height()))
+        x = max(avail.left(), min(x, avail.right() - w + 1))
+        y = max(avail.top(), min(y, avail.bottom() - h + 1))
+        self.setGeometry(x, y, w, h)
+        if info.get("maximized"):
+            self.setWindowState(self.windowState() | Qt.WindowMaximized)
+
     def shutdown_cleanup(self):
         self.pause_preview()
+        self.autosave_timer.stop()
+        self.save_window_geometry()
         self.settings["style"] = dict(self.style)
         self.save_ui_settings()
         if self.frame_reader:
@@ -3166,6 +3885,7 @@ if __name__ == "__main__":
         app = QApplication(sys.argv)
         window = MainWindow()
         window.show()
+        QTimer.singleShot(300, lambda: window.startup_checks(sys.argv[1:]))
         sys.exit(app.exec())
     except Exception:
         log.critical("Fatal startup error", exc_info=True)

@@ -1,8 +1,8 @@
-BONES CAPTION STUDIO - BETA
-===========================
+BONES CAPTION STUDIO
+====================
 
 Turns speech in your videos into styled, animated captions.
-Portable: nothing to install. Windows 10/11, 64-bit.
+Windows 10/11, 64-bit.
 
 GETTING STARTED
 1. Extract the whole zip first (right-click > Extract All). Don't run it from inside the zip.
@@ -25,18 +25,24 @@ TIPS
   the speaker pauses.
 - Click a word in the transcript to jump to it, double-click to fix it,
   press Delete to remove it.
-- Save Project (Ctrl+S) keeps your edits so you can come back later.
+- Save Project (Ctrl+S) keeps your edits in a .bcsproj file. File > Open Recent
+  brings back recent projects, and unsaved work is autosaved in case of a crash.
+- Captions a little early or late? Change "Timing offset". "Caption height"
+  nudges them up or down. For vertical exports, the Crop slider picks which part
+  of the picture to keep.
+- Help > Keyboard Shortcuts lists every shortcut. Help > Check for Updates.
 - Whisper models: Base is included and works offline. Small / Medium are more
   accurate but slower, and download once the first time you pick them.
 - GPU edition: NVIDIA cards transcribe much faster. The Transcription panel shows
   "GPU ready" when it finds one. Without an NVIDIA card it simply uses the CPU.
 - CPU edition: works on every PC. Longer videos take a few minutes.
 
-THIS FOLDER
+THIS FOLDER (portable zip)
 - portable.txt : keeps settings, logs and models inside this folder.
 - data\        : your settings, presets and debug_log.txt (created on first run).
 - models\      : Whisper speech models.
 - _internal\   : the app's own files. Don't move or delete anything in here.
+Installed version: settings and logs are in %APPDATA%\BonesCaptionStudio instead.
 
 FOUND A BUG?
 Click "Logs & Settings" at the top of the app and send debug_log.txt,

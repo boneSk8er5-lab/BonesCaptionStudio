@@ -2,7 +2,9 @@
 Bones Caption Studio - build environments + portable releases.
 
     python release.py setup [cpu|gpu|all]   one-time: create the private build environments
-    python release.py build [cpu|gpu|all]   build portable release zip(s)
+    python release.py build [cpu|gpu|all]   build beta test zip(s)  (v6.7.0-beta.1, -beta.2, ...)
+    python release.py build all final       build the FINAL public release (v6.7.0): portable zips
+                                            + Windows installers (installers need the free Inno Setup 6)
     python release.py run                   run the app from source (GPU environment if set up)
     python release.py clean [version]       tidy the releases folder, keeping one version's upload files
 
@@ -15,6 +17,9 @@ build (for testing) is kept in %LOCALAPPDATA%\\BonesCaptionStudio\\latest_build.
 
   CPU edition: small, runs on every Windows 10/11 64-bit PC.
   GPU edition: NVIDIA graphics cards transcribe much faster; on other PCs it falls back to the CPU.
+
+Installers (final releases): get Inno Setup 6 from https://jrsoftware.org/isdl.php (free). If it isn't
+installed, the final build still makes the portable zips and just skips the installers.
 """
 import hashlib
 import json
@@ -115,10 +120,10 @@ def recycle(paths):
 
 
 def release_files(version):
-    """The upload files for one version: the zip (or its .001/.002 parts) and the JOIN .bat."""
+    """The upload files for one version: zips (or .001/.002 parts + JOIN .bat) and installers."""
     return [n for n in os.listdir(OUT_ROOT)
             if f"_v{version}_" in n and os.path.isfile(os.path.join(OUT_ROOT, n))
-            and re.search(r"\.zip(\.\d{3})?$|^JOIN_.*\.bat$", n)]
+            and re.search(r"\.zip(\.\d{3})?$|^JOIN_.*\.bat$|_Setup(-\d+)?\.(exe|bin)$", n)]
 
 
 def tidy_releases(keep_version):
@@ -264,7 +269,7 @@ def split_file(path):
     return parts, join_bat
 
 
-def build_edition(ed, version, base_model, docs):
+def build_edition(ed, version, base_model, docs, final=False):
     info = EDITIONS[ed]
     py = env_python(ed)
     say("")
@@ -314,17 +319,58 @@ def build_edition(ed, version, base_model, docs):
     digest = sha256_of(zip_path)
     say("Zip:", os.path.basename(zip_path), human(size))
     result = {"edition": info["label"], "zip": os.path.basename(zip_path), "size": size,
-              "sha256": digest, "parts": [], "join": None}
+              "sha256": digest, "parts": [], "join": None, "installer": []}
     if size >= GITHUB_LIMIT:
         say("Over GitHub's 2 GB limit - splitting into parts...")
         parts, join_bat = split_file(zip_path)
         result["parts"] = [os.path.basename(p) for p in parts]
         result["join"] = os.path.basename(join_bat)
         say("Parts:", ", ".join(result["parts"]), "+", result["join"])
+    if final:
+        result["installer"] = build_installer(ed, version, out_dir)
     return result
 
 
-def write_notes(version, results):
+def find_iscc():
+    """Inno Setup's command-line compiler, if installed."""
+    found = shutil.which("ISCC.exe") or shutil.which("iscc")
+    if found:
+        return found
+    for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles"),
+                 os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs")):
+        if base:
+            path = os.path.join(base, "Inno Setup 6", "ISCC.exe")
+            if os.path.exists(path):
+                return path
+    return None
+
+
+def build_installer(ed, version, app_dir):
+    """Make BonesCaptionStudio_v<version>_<tag>_Setup.exe (plus -1.bin, -2.bin... if it's huge)."""
+    iscc = find_iscc()
+    if not iscc:
+        say("Installer skipped: Inno Setup 6 isn't installed (free: https://jrsoftware.org/isdl.php).")
+        return []
+    info = EDITIONS[ed]
+    name = f"BonesCaptionStudio_v{version}_{info['zip_tag']}_Setup"
+    for old in os.listdir(OUT_ROOT):
+        if old.startswith(name):
+            os.remove(os.path.join(OUT_ROOT, old))
+    cmd = [iscc, "/Q", f"/DAppVersion={version}", f"/DEdition={info['label']}",
+           f"/DSourceDir={app_dir}", f"/DOutputDir={OUT_ROOT}", f"/DOutputName={name}"]
+    if folder_size(app_dir) > 1800 * 1024 ** 2:
+        cmd.append("/DSpan=1")
+    cmd.append(os.path.join(ROOT, "installer", "BonesCaptionStudio.iss"))
+    say("Making the installer (a few minutes)...")
+    if run(cmd) != 0:
+        say("WARNING: the installer failed - see release_log.txt. The portable zip is still fine.")
+        return []
+    files = sorted(n for n in os.listdir(OUT_ROOT) if n.startswith(name))
+    say("Installer:", ", ".join(f"{n} ({human(os.path.getsize(os.path.join(OUT_ROOT, n)))})" for n in files))
+    return files
+
+
+def write_notes(version, results, final=False):
     changes = ""
     try:
         with open("CHANGELOG.md", "r", encoding="utf-8") as f:
@@ -345,10 +391,19 @@ def write_notes(version, results):
         else:
             files, how = f"`{r['zip']}`", "download it"
         downloads.append(f"- {who}: {files} ({human(r['size'])}). To use: {how}.")
+        if r.get("installer"):
+            setup = r["installer"]
+            extra = (f" Keep `{'`, `'.join(setup[1:])}` in the same folder as the Setup.exe." if len(setup) > 1 else "")
+            downloads.append(f"  - Or install it: `{setup[0]}` (adds a Start menu shortcut; no admin rights needed).{extra}")
     sums = "\n".join(f"- `{r['zip']}`: `{r['sha256']}`" for r in results)
+    if final:
+        header = ("Windows 10/11 (64-bit). Pick the **portable zip** (nothing to install, runs from any folder "
+                  "or USB stick) or the **installer** (Start menu shortcut, double-click .bcsproj projects).")
+    else:
+        header = "**Beta test build.** Portable, nothing to install. Windows 10/11 (64-bit)."
     notes = f"""# Bones Caption Studio v{version}
 
-**Beta test build.** Portable, nothing to install. Windows 10/11 (64-bit).
+{header}
 
 ## Which download?
 {chr(10).join(downloads)}
@@ -356,7 +411,8 @@ def write_notes(version, results):
 Not sure? Take the CPU edition.
 
 ## Run it
-1. Right-click the zip and choose **Extract All**. Don't run it from inside the zip.
+1. Portable zip: right-click it and choose **Extract All**. Don't run it from inside the zip.
+   (Installer: just run the Setup.exe and skip to step 3.)
 2. Open the extracted folder and double-click **BonesCaptionStudio.exe**.
 3. If Windows shows "Windows protected your PC" (the app isn't code-signed yet), click **More info**, then **Run anyway**.
 
@@ -378,9 +434,12 @@ Click **📂 Logs & Settings** at the top of the app and attach `debug_log.txt`,
     return path
 
 
-def build(editions):
+def build(editions, final=False):
     base, beta, counters = next_version()
-    version = f"{base}-beta.{beta}"
+    version = base if final else f"{base}-beta.{beta}"
+    if final:
+        say("FINAL release build (no beta number)." + ("" if find_iscc() else
+            "  Inno Setup not found, so installers will be skipped."))
     say(f"=== Bones Caption Studio release v{version} ===")
     ready = [ed for ed in editions if env_ready(ed)]
     if not ready:
@@ -401,15 +460,16 @@ def build(editions):
 
     results = []
     for ed in editions:
-        result = build_edition(ed, version, base_model, docs)
+        result = build_edition(ed, version, base_model, docs, final)
         if result:
             results.append(result)
     if not results:
         fail("Nothing was built")
-    notes = write_notes(version, results)
-    counters[base] = beta
-    with open(COUNTER_FILE, "w", encoding="utf-8") as f:
-        json.dump(counters, f, indent=2)
+    notes = write_notes(version, results, final)
+    if not final:
+        counters[base] = beta
+        with open(COUNTER_FILE, "w", encoding="utf-8") as f:
+            json.dump(counters, f, indent=2)
     tidy_releases(version)
     say("")
     say("RELEASE OK")
@@ -424,7 +484,7 @@ def clean(version=None):
     """Keep only one version's upload files (default: the newest) and reset the beta counter to it."""
     if not version:
         base, beta, _ = next_version()
-        version = f"{base}-beta.{beta - 1}"
+        version = base if release_files(base) else f"{base}-beta.{beta - 1}"
     version = version.lstrip("v")
     if not release_files(version):
         fail(f"No release files for v{version} in {OUT_ROOT}")
@@ -446,14 +506,17 @@ def clean(version=None):
 if __name__ == "__main__":
     LOG.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')}  {' '.join(sys.argv[1:])} =====\n")
     command = sys.argv[1] if len(sys.argv) > 1 else "build"
-    arg = sys.argv[2] if len(sys.argv) > 2 else None
+    args = [a.lower() for a in sys.argv[2:]]
+    final = "final" in args
+    args = [a for a in args if a != "final"]
+    arg = args[0] if args else None
     if command == "setup":
         setup(pick_editions(arg))
     elif command == "build":
-        build(pick_editions(arg))
+        build(pick_editions(arg), final)
     elif command == "run":
         run_app()
     elif command == "clean":
         clean(arg)
     else:
-        fail(f"Unknown command '{command}' (use setup, build or run)")
+        fail(f"Unknown command '{command}' (use setup, build, run or clean)")
