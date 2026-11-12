@@ -261,10 +261,15 @@ def split_file(path):
     names = [os.path.basename(p) for p in parts]
     join_bat = os.path.join(os.path.dirname(path), f"JOIN_{os.path.basename(path)}.bat")
     with open(join_bat, "w", encoding="utf-8", newline="\r\n") as f:
-        f.write("@echo off\ncd /d \"%~dp0\"\n"
+        missing = "".join(f'if not exist "{n}" (echo MISSING: {n} - download it into this folder too.& set BAD=1)\n'
+                          for n in names)
+        f.write("@echo off\ncd /d \"%~dp0\"\nset BAD=\n" + missing +
+                "if defined BAD (echo.& echo Can't join yet: a part is missing.& pause & exit /b 1)\n"
                 "echo Joining the download parts into one zip...\n"
                 f"copy /b {'+'.join(chr(34) + n + chr(34) for n in names)} \"{os.path.basename(path)}\"\n"
                 f"echo Done: {os.path.basename(path)}  -  right-click it and choose Extract All.\npause\n")
+    if sum(os.path.getsize(p) for p in parts) != os.path.getsize(path):
+        fail(f"Splitting {os.path.basename(path)} went wrong (parts don't add up). The full zip was kept.")
     os.remove(path)
     return parts, join_bat
 
@@ -316,8 +321,13 @@ def build_edition(ed, version, base_model, docs, final=False):
                 full = os.path.join(root, fn)
                 z.write(full, os.path.relpath(full, test_root))
     size = os.path.getsize(zip_path)
+    say("Checking the zip opens and every file is intact...")
+    with zipfile.ZipFile(zip_path) as z:
+        bad = z.testzip()
+    if bad:
+        fail(f"The zip is damaged ({bad}). Nothing was published - try the build again.")
     digest = sha256_of(zip_path)
-    say("Zip:", os.path.basename(zip_path), human(size))
+    say("Zip:", os.path.basename(zip_path), human(size), "(checked OK)")
     result = {"edition": info["label"], "zip": os.path.basename(zip_path), "size": size,
               "sha256": digest, "parts": [], "join": None, "installer": []}
     if size >= GITHUB_LIMIT:
