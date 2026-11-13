@@ -1,0 +1,23 @@
+# The Bones Caption Studio guide: one topic per line, in reading order (file name without .md).
+# Each topic is a simple text file in this folder:
+#   # Title                        first line
+#   ## Smaller heading
+#   1. Step                        numbered steps (one per line, in a row)
+#   - Point                        bullet points
+#   ![What the picture shows](picture.png)    a picture from the images folder, on its own line
+#   > Tip text                     a highlighted tip
+#   **bold**, `Ctrl+S` (keys or exact text), [link text](topic:voices) (link to another topic)
+# Pictures are made by make_guide_pictures.bat. The web page and PDF are made by build_guide.bat.
+what-it-does
+get-started
+first-captions
+caption-modes
+caption-style
+transcript-editor
+voices
+audio-tracks
+export
+projects
+settings-and-look
+shortcuts
+when-something-goes-wrong

@@ -1367,6 +1367,7 @@ class MainWindow(QMainWindow):
         primary = "#1565C0" if colorblind_mode else "#00ADB5"
         primary_hover = "#1976D2" if colorblind_mode else "#00FFF5"
         text_accent = "#FFFFFF" if colorblind_mode else "#121212"
+        self.accent_color, self.accent_text = primary, text_accent   # used by the guide window
         danger_hover = "#D32F2F" if colorblind_mode else "#3A1E1E"
         danger_text = "#FFFFFF" if colorblind_mode else "#FF5A5A"
 
@@ -3601,7 +3602,8 @@ class MainWindow(QMainWindow):
         add(m, "detect", "Detect &Voices", lambda: self.detect_voices(), "F6")
 
         m = bar.addMenu("&Help")
-        add(m, "shortcuts", "&Keyboard Shortcuts", self.show_shortcuts, "F1")
+        add(m, "guide", "User &Guide", self.show_guide, "F1")
+        add(m, "shortcuts", "&Keyboard Shortcuts", self.show_shortcuts, "Ctrl+F1")
         add(m, "logs", "Open &Logs && Settings Folder", lambda: self.open_folder(DATA_DIR, is_dir=True))
         m.addSeparator()
         assoc = add(m, "assoc", "Open .bcsproj Files with Bones Caption Studio", self.toggle_file_association,
@@ -3655,7 +3657,7 @@ class MainWindow(QMainWindow):
                 ("Ctrl+F", "Search the transcript"), ("Delete", "Hide / show selected lines or words"),
                 ("Shift+Delete", "Delete selected words permanently"), ("1 - 9", "Give selected lines that voice"),
                 ("0", "Remove the voice from selected lines"), ("Double-click", "Edit a line or word"),
-                ("Right-click", "More transcript options"), ("F1", "This list")]
+                ("Right-click", "More transcript options"), ("F1", "User guide"), ("Ctrl+F1", "This list")]
         html = "<table cellspacing='6'>" + "".join(
             f"<tr><td><b>{k}</b></td><td>{v}</td></tr>" for k, v in rows) + "</table>"
         box = QMessageBox(self)
@@ -3663,6 +3665,12 @@ class MainWindow(QMainWindow):
         box.setTextFormat(Qt.RichText)
         box.setText(html)
         box.exec()
+
+    def show_guide(self, topic=None):
+        import user_guide as guide
+        dialog = guide.make_dialog(self, resource_path("guide"), APP_VERSION_FULL, start_topic=topic,
+                                   export_dir=os.path.join(DATA_DIR, "guide"))
+        dialog.exec()
 
     def show_about(self):
         edition = "GPU (NVIDIA)" if "GPU" in APP_VERSION_FULL else ("CPU" if "CPU" in APP_VERSION_FULL else "from source")
@@ -3881,6 +3889,17 @@ if __name__ == "__main__":
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Bones.CaptionStudio")
         except Exception:
             pass
+    if "--export-guide" in sys.argv:
+        # build_guide.bat: save the guide as a web page, no window
+        import user_guide as guide
+        i = sys.argv.index("--export-guide")
+        out = sys.argv[i + 1] if len(sys.argv) > i + 1 else os.path.join(app_dir(), "docs")
+        try:
+            print(guide.export_html(resource_path("guide"), out, APP_VERSION_FULL))
+            sys.exit(0)
+        except Exception:
+            log.error("Couldn't export the guide", exc_info=True)
+            sys.exit(1)
     try:
         app = QApplication(sys.argv)
         window = MainWindow()

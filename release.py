@@ -464,6 +464,7 @@ def build(editions, final=False):
                 fail(f"{tool} not found next to release.py")
     docs = [os.path.join(ROOT, "release_files", "README.txt"),
             os.path.join(ROOT, "release_files", "LICENSE.txt"),
+            os.path.join(ROOT, "docs", "Bones Caption Studio guide.pdf"),  # made by build_guide.bat
             os.path.join(ROOT, "release_files", "THIRD_PARTY_NOTICES.txt"),
             os.path.join(ROOT, "CHANGELOG.md")]
     docs = [d for d in docs if os.path.exists(d)]

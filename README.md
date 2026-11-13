@@ -30,6 +30,7 @@ The Whisper *Base* model is included, so it works offline out of the box.
 - Projects (`.bcsproj`): File menu with New / Open / Open Recent / Save As, autosave and crash recovery, double-click a project to open it
 - Caption timing offset and height fine-tuning, crop position for vertical exports
 - Progress for model downloads and transcription, with Cancel
+- Built-in User Guide (Help › User Guide, F1), also as a PDF in each release
 - Style presets, any installed font with favourites, Reset settings to defaults, Check for Updates
 - Red-green colour-blind friendly theme option
 
@@ -46,6 +47,8 @@ setup_build_tools.bat    # one time: private CPU + GPU build environments (your 
 run_from_source.bat      # run the app from source
 release.bat              # beta test build: both portable editions into %USERPROFILE%\BonesCaptionStudio_Releases
 release_final.bat        # final release: portable zips + installers (installers need the free Inno Setup 6)
+make_guide_pictures.bat  # retake the guide's pictures (demo video + demo captions, never your own files)
+build_guide.bat          # guide -> docs\guide.html + docs\Bones Caption Studio guide.pdf (put in every release)
 ```
 
 ## License

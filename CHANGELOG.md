@@ -14,6 +14,12 @@
   (installer, or Help › "Open .bcsproj files with Bones Caption Studio" for the portable version).
 - The window opens at the size and position you left it (never off-screen).
 
+**Help**
+- New **User Guide** (Help › User Guide, `F1`): 13 short how-to topics with pictures, from first captions
+  to voices, audio tracks, exports and fixing problems. **Open in Web Browser** shows it as one page to read
+  or print. Keyboard Shortcuts moved to `Ctrl+F1`.
+- Each release includes the guide as a PDF.
+
 **Captions & export**
 - **Timing offset** (−5 to +5 s) moves all captions earlier or later.
 - **Caption height** fine-tunes how high or low captions sit.

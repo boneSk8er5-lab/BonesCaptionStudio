@@ -30,7 +30,8 @@ TIPS
 - Captions a little early or late? Change "Timing offset". "Caption height"
   nudges them up or down. For vertical exports, the Crop slider picks which part
   of the picture to keep.
-- Help > Keyboard Shortcuts lists every shortcut. Help > Check for Updates.
+- Help > User Guide (F1) explains everything, step by step. The same guide is in
+  this folder as "Bones Caption Studio guide.pdf". Help > Check for Updates.
 - Whisper models: Base is included and works offline. Small / Medium are more
   accurate but slower, and download once the first time you pick them.
 - GPU edition: NVIDIA cards transcribe much faster. The Transcription panel shows
